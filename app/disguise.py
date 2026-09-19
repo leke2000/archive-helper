@@ -83,6 +83,41 @@ def _looks_like_media(head: bytes) -> bool:
     return False
 
 
+def _is_blank(buf: bytes) -> bool:
+    """All zero bytes — 网盘未下载的部分会被填零。"""
+    return len(buf) > 0 and buf == b"\x00" * len(buf)
+
+
+def _tail_reversed_ok(path: str, size: int) -> Detection | None:
+    """Try to interpret the file as [decoy][body][reverse(decoy)][L].
+
+    Accepts when the reversed trailer starts with a real archive signature.
+    The decoy header itself may be zeroed out on an incomplete download, so
+    looking like a media file is supporting evidence, not a requirement.
+    """
+    if size <= 16:
+        return None
+    last4 = _read_tail(path, 4)
+    L = int.from_bytes(last4, "little")
+    if not (0 < L < size - 8 and L <= size - 4 - L):
+        return None
+    tail_block = _read_tail(path, 4 + L)[:L]
+    reversed_head = tail_block[::-1]
+    sig = _sig_name(reversed_head)
+    if not sig:
+        return None
+
+    head = _read_head(path, 64)
+    notes = [f"decoy {L} bytes, restored head is {sig}"]
+    if _looks_like_media(head):
+        notes.append("decoy looks like media")
+    elif _is_blank(head):
+        notes.append("decoy header is blank (可能下载不完整)")
+    else:
+        notes.append("decoy header unrecognised; accepted by trailer signature")
+    return Detection("tail_reversed", L, 0, sig, notes)
+
+
 def detect(path: str) -> Detection:
     """Classify how (if at all) the file is disguised."""
     size = os.path.getsize(path)
@@ -90,21 +125,13 @@ def detect(path: str) -> Detection:
 
     # already a real archive?
     if _sig_name(head):
-        return Detection("plain", 0, 0, _sig_name(head), ["file already starts with an archive signature"])
+        return Detection("plain", 0, 0, _sig_name(head),
+                         ["file already starts with an archive signature"])
 
-    # --- tail-reversed ---
-    if size > 16:
-        last4 = _read_tail(path, 4)
-        L = int.from_bytes(last4, "little")
-        if 0 < L < size - 8 and L <= size - 4 - L:
-            tail_block = _read_tail(path, 4 + L)[:L]
-            reversed_head = tail_block[::-1]
-            sig = _sig_name(reversed_head)
-            if sig and _looks_like_media(head):
-                return Detection(
-                    "tail_reversed", L, 0, sig,
-                    [f"decoy {L} bytes, restored head is {sig}"],
-                )
+    # --- tail-reversed (Apate style) ---
+    d = _tail_reversed_ok(path, size)
+    if d is not None:
+        return d
 
     # --- appended archive: scan for a signature inside the file ---
     for sig in ARCHIVE_SIGS:

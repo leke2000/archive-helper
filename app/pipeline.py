@@ -42,8 +42,10 @@ ProgressFn = Callable[[int, int], None]
 
 
 class Pipeline:
-    def __init__(self, sz: SevenZip | None = None):
+    def __init__(self, sz: SevenZip | None = None, salvage: bool = True):
         self.sz = sz or SevenZip()
+        # salvage=True: 数据校验失败时仍然尝试解压，尽量救出未损坏的部分
+        self.salvage = salvage
 
     # -- helpers -----------------------------------------------------------
     @staticmethod
@@ -84,6 +86,23 @@ class Pipeline:
         yield None, ok, out
 
     # -- main --------------------------------------------------------------
+    @staticmethod
+    def _ensure_dir(path: str, retries: int = 12, delay: float = 5.0) -> None:
+        """Create a directory, retrying while the volume is temporarily offline.
+
+        外置硬盘/网络盘会短暂掉线，直接 makedirs 会抛 FileNotFoundError。
+        """
+        import time as _time
+        last = None
+        for attempt in range(retries):
+            try:
+                os.makedirs(path, exist_ok=True)
+                return
+            except (FileNotFoundError, OSError) as exc:
+                last = exc
+                _time.sleep(delay)
+        raise RuntimeError(f"无法创建目录 {path}（磁盘可能离线）: {last}")
+
     def process(
         self,
         source: str,
@@ -96,8 +115,8 @@ class Pipeline:
         keep_source: bool = True,
     ) -> Result:
         res = Result(source=source, ok=False)
-        os.makedirs(workdir, exist_ok=True)
-        os.makedirs(outdir, exist_ok=True)
+        self._ensure_dir(workdir)
+        self._ensure_dir(outdir)
 
         try:
             det = disguise.detect(source)
@@ -117,6 +136,7 @@ class Pipeline:
             # test integrity first (avoids producing half-extracted junk)
             pw_used = None
             tested = False
+            salvaged = False
             for pw, ok, _out in self._try_passwords(archive, passwords):
                 if not ok:
                     continue
@@ -127,23 +147,33 @@ class Pipeline:
                     res.add(f"完整性校验通过 (密码: {pw or '无'})")
                     log(res.steps[-1])
                     break
+                # 数据校验失败通常是下载不完整（有零区）。仍然尝试解压，
+                # 能救出多少算多少，只是内容可能不完整。
                 res.add(f"密码 {pw} 可打开但数据校验失败（可能下载不完整）")
                 log(res.steps[-1])
+                salvaged = True
 
-            if not tested:
+            if not tested and not (salvaged and self.salvage):
                 res.error = "无法通过完整性校验（密码错误或文件损坏）"
                 log("错误: " + res.error)
                 return res
+            if not tested:
+                log("尝试抢救式解压（文件不完整，可能只有部分内容）...")
+                res.add("抢救式解压：仅能恢复未损坏的部分")
 
             # extract
             log("解压中...")
             ok, out = self.sz.extract(archive, outdir, pw_used)
-            if not ok:
-                res.error = "解压失败"
-                log("错误: " + res.error)
-                return res
+            if not ok and not tested:
+                # 7z 对损坏包返回非零，但仍可能已写出可用文件
+                files_now, _ = self._dir_stats(outdir)
+                if files_now == 0:
+                    res.error = "解压失败"
+                    log("错误: " + res.error)
+                    return res
+                log(f"解压报告异常，但已恢复 {files_now} 个文件")
 
-            # recurse into any nested volumes
+            # recurse into any nested volumes (salvage path needs this too)
             if recurse:
                 self._extract_nested(outdir, passwords, log)
 
@@ -175,15 +205,21 @@ class Pipeline:
                         targets.append(os.path.join(r, f))
             if not targets:
                 return
+            progressed = False
             for t in targets:
+                if not os.path.exists(t):
+                    continue
                 for pw, ok, _o in self._try_passwords(t, passwords):
                     if not ok:
-                        continue
+                        break
                     log(f"解压嵌套分卷 {os.path.basename(t)}")
-                    good, _out = self.sz.extract(t, os.path.dirname(t), pw)
-                    if good:
-                        self._delete_volume_set(t)
+                    self.sz.extract(t, os.path.dirname(t), pw)
+                    # 无论 7z 是否报告完全成功，都清掉分卷避免下一轮重复处理
+                    self._delete_volume_set(t)
+                    progressed = True
                     break
+            if not progressed:
+                return
 
     @staticmethod
     def _delete_volume_set(vol001: str):

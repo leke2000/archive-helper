@@ -43,6 +43,60 @@ def _stem(name: str) -> str:
     return base
 
 
+def collect_sources(src_dir: str, only: list[str] | None = None,
+                    recursive: bool = True, already: set[str] | None = None):
+    """Gather candidate files.
+
+    Returns a list of (path, rel_key) where rel_key uniquely identifies the
+    file relative to src_dir (used for the processed-marker).
+
+    A file is considered processed if either its relative path or its bare
+    file name appears in *already*, so switching between recursive and
+    non-recursive scanning still de-duplicates correctly.
+    """
+    already = already or set()
+
+    def seen(rel: str, name: str) -> bool:
+        return rel in already or name in already
+
+    out = []
+    if recursive:
+        for r, _dirs, fs in os.walk(src_dir):
+            for n in fs:
+                p = os.path.join(r, n)
+                rel = os.path.relpath(p, src_dir)
+                if n.endswith(".qkdownloading"):
+                    continue
+                if only and n not in only and rel not in only:
+                    continue
+                if seen(rel, n):
+                    continue
+                out.append((p, rel))
+    else:
+        for n in sorted(os.listdir(src_dir)):
+            p = os.path.join(src_dir, n)
+            if not os.path.isfile(p):
+                continue
+            if n.endswith(".qkdownloading"):
+                continue
+            if only and n not in only:
+                continue
+            if seen(n, n):
+                continue
+            out.append((p, n))
+    out.sort(key=lambda t: os.path.getsize(t[0]))
+    return out
+
+
+def _is_archive_candidate(path: str) -> bool:
+    """Cheap pre-filter: skip obvious non-archives (docs, installers)."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".mp4", ".mov", ".mkv", ".avi", ".webm", ".jpg", ".jpeg",
+               ".png", ".gif", ".webp", ".7z", ".zip", ".rar", ".001"):
+        return True
+    return False
+
+
 def run_auto(
     src_dir: str,
     staging: str,
@@ -52,8 +106,9 @@ def run_auto(
     keep_source: bool = False,
     only: list[str] | None = None,
     skip_ok_marker: bool = True,
+    recursive: bool = True,
 ) -> int:
-    """Process every complete file in src_dir. Returns count of failures."""
+    """Process every complete file under src_dir. Returns count of failures."""
     pipe = Pipeline(SevenZip())
     done_file = os.path.join(staging, "_processed.txt")
     already: set[str] = set()
@@ -61,70 +116,72 @@ def run_auto(
         with open(done_file, encoding="utf-8", errors="replace") as f:
             already = {ln.strip() for ln in f if ln.strip()}
 
-    files = []
-    for n in sorted(os.listdir(src_dir)):
-        p = os.path.join(src_dir, n)
-        if not os.path.isfile(p):
-            continue
-        if n.endswith(".qkdownloading"):
-            continue
-        if only and n not in only:
-            continue
-        if n in already:
-            continue
-        files.append(p)
-    files.sort(key=os.path.getsize)
+    files = collect_sources(src_dir, only, recursive, already)
+    files = [(p, k) for p, k in files if _is_archive_candidate(p)]
 
     os.makedirs(staging, exist_ok=True)
     os.makedirs(dest, exist_ok=True)
 
-    print(f"待处理 {len(files)} 个文件")
+    print(f"待处理 {len(files)} 个文件（递归={recursive}）")
     failures = 0
-    for i, src in enumerate(files, 1):
+    for i, (src, key) in enumerate(files, 1):
         name = os.path.basename(src)
-        size = os.path.getsize(src)
-        print(f"\n=== [{i}/{len(files)}] {name}  ({_fmt(size)}) ===")
+        try:
+            size = os.path.getsize(src)
+        except OSError:
+            continue
+        stem = _stem(name)
+
+        print(f"\n=== [{i}/{len(files)}] {key}  ({_fmt(size)}) ===")
         sys.stdout.flush()
 
-        stem = _stem(name)
         outdir = os.path.join(staging, stem)
         workdir = os.path.join(staging, "_work")
 
-        res = pipe.process(
-            src, workdir, outdir, passwords,
-            log=lambda m: print("   " + m),
-            recurse=True,
-        )
-        if not res.ok:
-            print(f"   !! 跳过: {res.error}")
+        # 单个文件失败不应中断整批（磁盘掉线、坏包等）
+        try:
+            res = pipe.process(
+                src, workdir, outdir, passwords,
+                log=lambda m: print("   " + m),
+                recurse=True,
+            )
+            if not res.ok:
+                print(f"   !! 跳过: {res.error}")
+                failures += 1
+                shutil.rmtree(outdir, ignore_errors=True)
+                continue
+
+            # archive the extracted media, then drop the staging copy
+            moved, mbytes, errors = pipe.archive_by_type(
+                outdir, dest, log=lambda m: print("   " + m), move=True,
+            )
+            shutil.rmtree(outdir, ignore_errors=True)
+            shutil.rmtree(workdir, ignore_errors=True)
+
+            if errors:
+                print(f"   归档有 {len(errors)} 个失败（文件保留在暂存区）")
+            if not keep_source:
+                try:
+                    os.chmod(src, 0o666)
+                except OSError:
+                    pass
+                try:
+                    os.remove(src)
+                    print("   已删除源文件")
+                except OSError as e:
+                    print(f"   源文件删除失败: {e}")
+        except Exception as exc:
+            print(f"   !! 异常，跳过该文件: {type(exc).__name__}: {exc}")
             failures += 1
             shutil.rmtree(outdir, ignore_errors=True)
             continue
 
-        # archive the extracted media, then drop the staging copy
-        moved, mbytes, errors = pipe.archive_by_type(
-            outdir, dest, log=lambda m: print("   " + m), move=True,
-        )
-        shutil.rmtree(outdir, ignore_errors=True)
-        shutil.rmtree(workdir, ignore_errors=True)
-
-        if errors:
-            print(f"   归档有 {len(errors)} 个失败（文件保留在暂存区）")
-        if not keep_source:
-            try:
-                os.chmod(src, 0o666)
-            except OSError:
-                pass
-            try:
-                os.remove(src)
-                print("   已删除源文件")
-            except OSError as e:
-                print(f"   源文件删除失败: {e}")
-
         with open(done_file, "a", encoding="utf-8") as f:
-            f.write(name + "\n")
+            f.write(key + "\n")
+            if key != name:
+                f.write(name + "\n")
 
-    print(f"\n完成。失败 {failures} 个。")
+    print(f"\n完成。成功 {len(files) - failures} 个，失败 {failures} 个。")
     return failures
 
 
@@ -137,6 +194,8 @@ def main(argv=None):
                     help="密码，可多次指定")
     ap.add_argument("--keep-source", action="store_true", help="保留源压缩包")
     ap.add_argument("--only", nargs="*", help="只处理指定文件名")
+    ap.add_argument("--no-recursive", action="store_true",
+                    help="只处理顶层文件，不进入子目录")
     ap.add_argument("--gui", action="store_true", help="启动图形界面")
     args = ap.parse_args(argv)
 
@@ -148,6 +207,7 @@ def main(argv=None):
     return run_auto(
         args.src, args.staging, args.dest, args.password,
         keep_source=args.keep_source, only=args.only,
+        recursive=not args.no_recursive,
     )
 
 

@@ -13,6 +13,29 @@ from .sevenzip import SevenZip, find_7za
 
 PAD = 8
 
+# 只把像压缩包/媒体伪装包的文件送进流水线，避免把说明文档也拖进去
+_CANDIDATE_EXT = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".jpg", ".jpeg",
+                  ".png", ".gif", ".webp", ".7z", ".zip", ".rar", ".001"}
+
+
+def _is_candidate(path: str) -> bool:
+    return os.path.splitext(path)[1].lower() in _CANDIDATE_EXT
+
+
+def _stem_name(name: str) -> str:
+    """剥掉媒体 + 压缩两种扩展名: 'a.7z.mp4' -> 'a'."""
+    base = name
+    for ext in (".mp4", ".mov", ".mkv", ".avi", ".webm", ".jpg", ".jpeg",
+                ".png", ".gif", ".webp"):
+        if base.lower().endswith(ext):
+            base = base[:-len(ext)]
+            break
+    for ext in (".7z", ".zip", ".rar", ".001"):
+        if base.lower().endswith(ext):
+            base = base[:-len(ext)]
+            break
+    return base
+
 
 class App(tk.Tk):
     def __init__(self):
@@ -88,6 +111,10 @@ class App(tk.Tk):
         self.recurse_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(opt, text="自动处理嵌套分卷 (.001/.z01)", variable=self.recurse_var).grid(
             row=1, column=1, sticky="w", padx=6, pady=(0, 6))
+        self.subdir_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opt, text="扫描子目录（文件夹里按日期/作品分层的资源）",
+                        variable=self.subdir_var).grid(
+            row=2, column=1, sticky="w", padx=6, pady=(0, 6))
 
         run = ttk.Frame(root)
         run.pack(fill="x", padx=PAD, pady=PAD)
@@ -193,12 +220,20 @@ class App(tk.Tk):
         for part in src.split(";"):
             part = part.strip()
             if os.path.isdir(part):
-                for n in sorted(os.listdir(part)):
-                    fp = os.path.join(part, n)
-                    if os.path.isfile(fp):
-                        targets.append(fp)
+                if self.subdir_var.get():
+                    for r, _dirs, fs in os.walk(part):
+                        for n in fs:
+                            if n.endswith(".qkdownloading"):
+                                continue
+                            targets.append(os.path.join(r, n))
+                else:
+                    for n in sorted(os.listdir(part)):
+                        fp = os.path.join(part, n)
+                        if os.path.isfile(fp) and not n.endswith(".qkdownloading"):
+                            targets.append(fp)
             elif os.path.isfile(part):
                 targets.append(part)
+        targets = [t for t in targets if _is_candidate(t)]
         if not targets:
             messagebox.showwarning("提示", "没有找到可处理的文件")
             return
@@ -219,8 +254,11 @@ class App(tk.Tk):
             for i, t in enumerate(targets, 1):
                 self.log_q.put(("status", f"处理 {i}/{total}: {os.path.basename(t)}"))
                 self.log_q.put(("log", f"=== [{i}/{total}] {t} ==="))
-                stem = os.path.splitext(os.path.basename(t))[0]
-                sub = os.path.join(out, stem)
+                # 用父目录名 + 文件名去重，避免不同日期下的同名包互相覆盖
+                stem = _stem_name(os.path.basename(t))
+                parent = os.path.basename(os.path.dirname(t))
+                sub_name = stem if parent in ("", out) else f"{parent}_{stem}"
+                sub = os.path.join(out, sub_name)
                 res = pipe.process(
                     t, workdir, sub, pwds,
                     log=lambda m: self.log_q.put(("log", "  " + m)),

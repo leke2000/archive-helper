@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+build/
+dist/
+*.spec
+
+# 运行时产物
+_staging/
+*_processed.txt
+*.log
+
+# 本地发布脚本（含个人仓库信息）
+_publish.py

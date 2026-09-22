@@ -155,11 +155,18 @@ def run_auto(
             moved, mbytes, errors = pipe.archive_by_type(
                 outdir, dest, log=lambda m: print("   " + m), move=True,
             )
+
+            if errors:
+                # 安全闸门：有文件没能归档时，保留暂存内容和源包，绝不丢数据
+                print(f"   !! 有 {len(errors)} 个问题，保留 {outdir}，源文件未删除")
+                for e in errors[:5]:
+                    print("      " + e)
+                failures += 1
+                continue
+
             shutil.rmtree(outdir, ignore_errors=True)
             shutil.rmtree(workdir, ignore_errors=True)
 
-            if errors:
-                print(f"   归档有 {len(errors)} 个失败（文件保留在暂存区）")
             if not keep_source:
                 try:
                     os.chmod(src, 0o666)

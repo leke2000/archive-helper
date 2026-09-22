@@ -9,6 +9,8 @@ from __future__ import annotations
 import os
 import shutil
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Callable, Iterable
 
@@ -42,10 +44,13 @@ ProgressFn = Callable[[int, int], None]
 
 
 class Pipeline:
-    def __init__(self, sz: SevenZip | None = None, salvage: bool = True):
+    def __init__(self, sz: SevenZip | None = None, salvage: bool = True,
+                 copy_workers: int | None = None):
         self.sz = sz or SevenZip()
         # salvage=True: 数据校验失败时仍然尝试解压，尽量救出未损坏的部分
         self.salvage = salvage
+        # 归档时的并行拷贝线程数。文件多且小的时候收益很大（实测快十几倍）。
+        self.copy_workers = copy_workers or min(8, (os.cpu_count() or 4) * 2)
 
     # -- helpers -----------------------------------------------------------
     @staticmethod
@@ -194,15 +199,58 @@ class Pipeline:
             log("异常: " + res.error)
             return res
 
+    # 压缩包文件头，用于不依赖扩展名的识别
+    _ARCH_MAGIC = (
+        (b"7z\xbc\xaf\x27\x1c", "7z"),
+        (b"PK\x03\x04", "zip"),
+        (b"Rar!\x1a\x07\x01\x00", "rar"),
+        (b"Rar!\x1a\x07\x00", "rar"),
+    )
+
+    @classmethod
+    def _sniff_archive(cls, path: str) -> str | None:
+        """按文件头判断是不是压缩包，忽略扩展名。
+
+        有些资源会把内层包改名（如 .7z删除、.bin），只看后缀会漏掉。
+        """
+        try:
+            with open(path, "rb") as f:
+                head = f.read(8)
+        except OSError:
+            return None
+        for magic, kind in cls._ARCH_MAGIC:
+            if head.startswith(magic):
+                return kind
+        return None
+
     def _extract_nested(self, root: str, passwords: list[str], log: LogFn):
-        """Extract split volumes / nested archives found under root."""
+        """解开解压结果里嵌套的压缩包。
+
+        三层保险避免漏解：
+          1) 分卷 (.001/.z01 ...)
+          2) 有压缩包后缀 (.7z/.zip/.rar)
+          3) 上述都没有时，按文件头嗅探（应对 .7z删除 / .bin 这类改名）
+        每轮扫描一次，最多三轮，避免无限递归。
+        """
         for _ in range(3):
-            targets = []
+            volumes = []
+            named = []
+            sniffed = []
             for r, _d, fs in os.walk(root):
                 for f in fs:
                     low = f.lower()
+                    if low.endswith(".qkdownloading"):
+                        continue
+                    fp = os.path.join(r, f)
                     if low.endswith(".001") or low.endswith(".z01"):
-                        targets.append(os.path.join(r, f))
+                        volumes.append(fp)
+                    elif low.endswith((".7z", ".zip", ".rar")):
+                        named.append(fp)
+                    elif self._sniff_archive(fp):
+                        sniffed.append(fp)
+
+            # 优先分卷，其次明确后缀，最后才嗅探；嗅探放最后避免误伤媒体文件
+            targets = volumes + named + sniffed[:20]
             if not targets:
                 return
             progressed = False
@@ -212,10 +260,21 @@ class Pipeline:
                 for pw, ok, _o in self._try_passwords(t, passwords):
                     if not ok:
                         break
-                    log(f"解压嵌套分卷 {os.path.basename(t)}")
+                    before = self._dir_stats(root)[0]
                     self.sz.extract(t, os.path.dirname(t), pw)
-                    # 无论 7z 是否报告完全成功，都清掉分卷避免下一轮重复处理
-                    self._delete_volume_set(t)
+                    after = self._dir_stats(root)[0]
+                    if t.lower().endswith((".001", ".z01")):
+                        self._delete_volume_set(t)
+                    elif after > before:
+                        # 确实解出了新内容，才删掉内层包
+                        try:
+                            os.chmod(t, 0o666)
+                        except OSError:
+                            pass
+                        try:
+                            os.remove(t)
+                        except OSError:
+                            pass
                     progressed = True
                     break
             if not progressed:
@@ -245,74 +304,155 @@ class Pipeline:
         move: bool = True,
         progress: ProgressFn | None = None,
         skip_dirs: set[str] | None = None,
+        include_other: bool = True,
     ) -> tuple[int, int, list[str]]:
-        """Split media under src_root into <dest_root>/图片 and /视频.
+        """把 src_root 下的文件分类搬到目标目录。
 
-        Returns (moved_files, moved_bytes, errors).
+        图片 -> <dest>/图片/<顶层目录>/...
+        视频 -> <dest>/视频/<顶层目录>/...
+        其它 -> <dest>/其他/<顶层目录>/...   （include_other=True 时）
+
+        重要：绝不能静默丢弃文件。搬不动的会记进 errors，调用方据此决定
+        是否删除源文件。返回 (moved_files, moved_bytes, errors)。
         """
         skip_dirs = skip_dirs or set()
-        plan: list[tuple[str, str, str]] = []  # (src, dest, kind)
+        plan: list[tuple[str, str]] = []  # (src, dest)
+
+        def plan_tree(top_name: str, dir_path: str):
+            for r, _d, fs in os.walk(dir_path):
+                for f in fs:
+                    fp = os.path.join(r, f)
+                    kind = self._media_kind(fp)
+                    rel = os.path.relpath(fp, dir_path)
+                    sub = self._strip_dup(rel, top_name)
+                    if kind == "image":
+                        bucket = "图片"
+                    elif kind == "video":
+                        bucket = "视频"
+                    elif include_other:
+                        bucket = "其他"
+                    else:
+                        continue
+                    plan.append((fp, os.path.join(dest_root, bucket, top_name, sub)))
 
         for name in sorted(os.listdir(src_root)):
             p = os.path.join(src_root, name)
             if os.path.isdir(p):
                 if name in skip_dirs:
                     continue
-                for r, _d, fs in os.walk(p):
-                    for f in fs:
-                        fp = os.path.join(r, f)
-                        kind = self._media_kind(fp)
-                        if not kind:
-                            continue
-                        rel = os.path.relpath(fp, p)
-                        sub = self._strip_dup(rel, name)
-                        top = "图片" if kind == "image" else "视频"
-                        plan.append((fp, os.path.join(dest_root, top, name, sub), kind))
+                plan_tree(name, p)
             else:
                 kind = self._media_kind(p)
-                if kind:
-                    top = "图片" if kind == "image" else "视频"
-                    plan.append((p, os.path.join(dest_root, top, name), kind))
+                if kind == "image":
+                    bucket = "图片"
+                elif kind == "video":
+                    bucket = "视频"
+                elif include_other:
+                    bucket = "其他"
+                else:
+                    continue
+                plan.append((p, os.path.join(dest_root, bucket, name)))
 
         total = len(plan)
+        if total == 0:
+            return 0, 0, []
+
+        # 先批量把所有目标目录建好，避免多线程里反复 makedirs / 竞争
+        dest_dirs = {os.path.dirname(d) for _s, d in plan}
+        for d in dest_dirs:
+            self._ensure_dir(d)
+
+        # 同盘搬迁用 os.replace（瞬间完成）；跨盘才真的复制数据
+        same_volume = self._same_volume(src_root, dest_root)
+
         done = 0
         moved = 0
         moved_bytes = 0
         errors: list[str] = []
+        lock = threading.Lock()
 
-        for src, dst, _kind in plan:
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
+        def do_one(item):
+            src, dst = item
+            nonlocal done, moved, moved_bytes
+            err = None
+            nbytes = 0
             try:
                 ssz = os.path.getsize(src)
-                # already archived with identical size? just drop the source copy
                 try:
                     dsz = os.path.getsize(dst)
                 except OSError:
                     dsz = -1
                 if dsz == ssz:
+                    # 目标已有一份且大小一致，直接处理源文件
                     if move:
                         self._force_remove(src)
-                    moved += 1
-                    moved_bytes += dsz
+                    nbytes = dsz
+                elif same_volume and move:
+                    self._clear_readonly(dst)
+                    os.replace(src, dst)      # 同盘：瞬间改名，零拷贝
+                    nbytes = ssz
                 else:
                     if dsz >= 0:
                         self._clear_readonly(dst)
-                    shutil.copy2(src, dst)
+                    self._copy_file(src, dst)  # 跨盘：裸读写，避免元数据开销
                     if os.path.getsize(dst) != ssz:
                         raise OSError("大小不一致")
                     self._clear_readonly(dst)
                     if move:
                         self._force_remove(src)
-                    moved += 1
-                    moved_bytes += ssz
+                    nbytes = ssz
             except Exception as exc:
-                errors.append(f"{src} -> {dst}: {exc}")
-            done += 1
-            if progress and (done % 25 == 0 or done == total):
-                progress(done, total)
+                err = f"{src} -> {dst}: {exc}"
+
+            with lock:
+                done += 1
+                if err:
+                    errors.append(err)
+                else:
+                    moved += 1
+                    moved_bytes += nbytes
+                if progress and (done % 25 == 0 or done == total):
+                    progress(done, total)
+
+        workers = self.copy_workers
+        if workers > 1 and total > 1:
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                list(ex.map(do_one, plan))
+        else:
+            for it in plan:
+                do_one(it)
+
+        # 搬迁后仍留在源目录里的文件 = 没被安全归档的，必须报给调用方
+        leftover = [os.path.join(r, f)
+                    for r, _d, fs in os.walk(src_root) for f in fs]
+        if leftover:
+            errors.append(f"未能归档的文件 {len(leftover)} 个（保留在暂存区）: "
+                          + ", ".join(os.path.basename(x) for x in leftover[:5]))
+
         log(f"归档完成: {moved} 个文件, {moved_bytes/1048576:.1f} MB"
-            + (f", {len(errors)} 个失败" if errors else ""))
+            + (f", {len(errors)} 个问题" if errors else ""))
         return moved, moved_bytes, errors
+
+    @staticmethod
+    def _copy_file(src: str, dst: str, chunk: int = 4 << 20):
+        """裸读写复制。比 shutil.copy2 快数倍——后者会逐个文件同步元数据，
+        在网络盘/外置盘上这部分开销可能比数据本身还大。"""
+        with open(src, "rb") as fi, open(dst, "wb") as fo:
+            while True:
+                b = fi.read(chunk)
+                if not b:
+                    break
+                fo.write(b)
+
+    @staticmethod
+    def _same_volume(a: str, b: str) -> bool:
+        """判断两个路径是否在同一卷（用于决定能否用瞬时的 rename 搬迁）。"""
+        try:
+            da = os.path.splitdrive(os.path.abspath(a))[0].lower()
+            db = os.path.splitdrive(os.path.abspath(b))[0].lower()
+            return bool(da) and da == db
+        except Exception:
+            return False
 
     @staticmethod
     def _clear_readonly(path: str):

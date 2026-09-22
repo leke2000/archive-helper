@@ -56,6 +56,9 @@ class PasswordStore:
         self.scan_dir = scan_dir
         self._lock = threading.Lock()
         self._pws: list[str] = []
+        # 只记录"手动维护"的密码，写回文件时用这个，避免把自动扫描到的
+        # 说明文字/URL 固化进密码清单。
+        self._manual: list[str] = []
         self._mtime = 0.0
         self._found_files: list[str] = []
         self.last_load = 0.0
@@ -114,18 +117,31 @@ class PasswordStore:
         if not force and mtime == self._mtime:
             return False
         with self._lock:
+            from_file = self._read_file()
             merged: list[str] = []
-            for pw in self._read_file() + self._scan_txt() + self._pws:
+            for pw in from_file + self._scan_txt() + self._manual:
                 if pw and pw not in merged:
                     merged.append(pw)
             changed = merged != self._pws
             self._pws = merged
+            self._manual = from_file
             self._mtime = mtime
             self.last_load = time.time()
+            # 文件里若有不符合规则的残留（例如早先误写入的 URL），顺手清理
+            stale = [ln.strip().strip("\"'")
+                     for ln in (_read_text(self.path) or "").splitlines()
+                     if ln.strip() and not _plausible_password(ln.strip().strip("\"'"))]
+        if stale:
+            self._write_file(from_file)
         return changed
 
     # -- 写回 -------------------------------------------------------------
     def _write_file(self, pws: list[str]) -> None:
+        """写回密码文件。
+
+        只落盘"手动维护的密码"（self._manual），不把自动扫描到的内容写进去，
+        否则说明文件里的 URL / 广告词会被固化进密码清单。
+        """
         try:
             os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
             with open(self.path, "w", encoding="utf-8") as f:
@@ -137,22 +153,27 @@ class PasswordStore:
 
     def add(self, pw: str) -> bool:
         pw = (pw or "").strip()
-        if not pw:
+        if not pw or not _plausible_password(pw):
             return False
         with self._lock:
             if pw in self._pws:
                 return False
             self._pws.insert(0, pw)
-            snapshot = list(self._pws)
+            if pw not in self._manual:
+                self._manual.insert(0, pw)
+            snapshot = list(self._manual)
         self._write_file(snapshot)
         return True
 
     def remove(self, pw: str) -> bool:
         with self._lock:
-            if pw not in self._pws:
+            if pw in self._pws:
+                self._pws.remove(pw)
+            if pw in self._manual:
+                self._manual.remove(pw)
+            else:
                 return False
-            self._pws.remove(pw)
-            snapshot = list(self._pws)
+            snapshot = list(self._manual)
         self._write_file(snapshot)
         return True
 

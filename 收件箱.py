@@ -4,19 +4,26 @@
 用法（在 解压助手 目录下）:
     收件箱.py                      # 默认 D:\\dowm -> H:\\赏花阁
     收件箱.py <收件目录> <归档目录>
+    收件箱.py --delete-source      # 归档成功后删除源压缩包
 
-密码从 <收件目录>\\解压密码.txt 读取，每行一个，可写多个。
+密码从 <收件目录>\\解压密码.txt 读取（每行一个），也会自动从说明文件和
+目录名里提取 "密码:xxx"。详见 app/passwords.py。
 
 处理能力：
   * 普通压缩包 / 分卷 (.7z.001, .zip.001, .rar.001 ...)
   * 伪装扩展名 (xxx.7z.001.pdf, xxx.zip.mp4 ...)
-  * 尾部反转伪装 (Apate 类，见 disguise.py)
+  * 卷号后面带杂字 (26.7z.001删)
+  * 首卷丢了卷号 (26.7z + 26.7z.002)
+  * 分卷分散在不同子文件夹
+  * 尾部反转 / 追加型伪装 (Apate 类，见 app/disguise.py)
+  * 浏览器重复下载的副本自动去重
   * 下载中的 .qkdownloading 文件自动跳过
-  * 解压后按 图片/视频 分类归档，并删除源压缩包
+  * 解压后按 图片/视频/其他 分类归档
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shutil
@@ -43,62 +50,16 @@ SKIP_DIRS = {
     "《碧蓝航线》本地一键端",
 }
 
-_VOL_TAIL = re.compile(r"\.(7z|zip|rar)\.(\d{3})$", re.IGNORECASE)
-_SOLID_TAIL = re.compile(r"\.(7z|zip|rar)$", re.IGNORECASE)
-_PW_RE = re.compile(r"密码\s*[:：]?\s*([^\s,，、;；|]+)")
+# 形如 <base>.001 / <base>.002 ... ，后面允许跟杂字（如 "26.7z.001删"）
+_PART_RE = re.compile(r"^(?P<base>.*\.(?:7z|zip|rar))(?P<vol>\.\d{3})?(?P<tail>.*)$",
+                      re.IGNORECASE)
+# 名字像媒体 -> 可能是伪装包
+_MEDIA_EXT = {".mp4", ".mov", ".mkv", ".ts", ".jpg", ".jpeg", ".png", ".pdf",
+              ".avi", ".webm", ".m4v", ".gif", ".webp"}
 
 
 def log(msg: str) -> None:
     print(msg, flush=True)
-
-
-def _read_text(path: str) -> str | None:
-    for enc in ("utf-8-sig", "utf-8", "gbk", "utf-16"):
-        try:
-            with open(path, encoding=enc) as f:
-                return f.read()
-        except (UnicodeDecodeError, UnicodeError):
-            continue
-    return None
-
-
-def read_passwords(inbox: str) -> list[str]:
-    """读取可用密码。
-
-    统一走 app.passwords.PasswordStore，和图形界面共用一套逻辑：
-      1) 收件目录的密码文件（本工具维护，每行一个）
-      2) 收件目录里任何 .txt 中出现 "密码:xxx" 的内容
-      3) 以「密码」开头的目录名
-    """
-    from app.passwords import PasswordStore
-    store = PasswordStore(os.path.join(inbox, PASSWORD_FILE), inbox)
-    return store.get()
-
-
-def normalize(name: str):
-    """剥掉尾部伪装扩展名，找出真正的分卷名。
-
-    返回 (real_name, volume_no, is_archive)：
-      '218.花柒Hana.7z.7z.001.pdf' -> ('218.花柒Hana.7z.7z.001', 1, True)
-      'rizunya.7z.001'             -> ('rizunya.7z.001', 1, True)
-      '#2026年7月10日.zip.mp4'      -> ('#2026年7月10日.zip', 0, True)
-      'video.mp4'                  -> ('video.mp4', 0, False)
-    """
-    parts = name.split(".")
-    for cut in range(len(parts), 0, -1):
-        cand = ".".join(parts[:cut])
-        m = _VOL_TAIL.search(cand)
-        if m and m.end() == len(cand):
-            return cand, int(m.group(2)), True
-        m2 = _SOLID_TAIL.search(cand)
-        if m2 and m2.end() == len(cand):
-            return cand, 0, True
-    return name, 0, False
-
-
-def base_of(real: str) -> str:
-    m = _VOL_TAIL.search(real)
-    return real[: m.start()] if m else real
 
 
 def human(n: float) -> str:
@@ -109,71 +70,32 @@ def human(n: float) -> str:
     return f"{n:.0f}PB"
 
 
-def collect(inbox: str):
-    """递归扫描收件箱，返回 [(标签, 待打开路径, 源文件列表)]。"""
-    entries = []
-    disguised = []          # 伪装包：文件名像媒体，实际是压缩包
-    for root, dirs, files in os.walk(inbox):
-        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
-        for name in sorted(files):
-            low = name.lower()
-            if low.endswith(".qkdownloading"):
-                continue
-            fp = os.path.join(root, name)
-            real, no, is_arc = normalize(name)
-            if is_arc:
-                entries.append((root, name, fp, real, no))
-                continue
-            # 名字不像压缩包，但可能尾部反转伪装成媒体文件
-            ext = os.path.splitext(name)[1].lower()
-            if ext in (".mp4", ".mov", ".mkv", ".ts", ".jpg", ".jpeg", ".png", ".pdf"):
-                try:
-                    if detect(fp).kind in ("tail_reversed", "appended"):
-                        disguised.append(fp)
-                except Exception:
-                    pass
-
-    groups: dict[tuple, list] = {}
-    for e in entries:
-        groups.setdefault((e[0], base_of(e[3])), []).append(e)
-
-    items = []
-    for (root, base), members in groups.items():
-        primary = next((m for m in members if m[4] == 1), None)
-        if primary is None:
-            primary = next((m for m in members if m[4] == 0), None)
-        if primary is None:
-            continue
-
-        _, name, path, real, _no = primary
-        sources = [m[2] for m in members]
-        links = []
-        if real != name:
-            # 分卷必须用 7-Zip 认得的名字才能找到后续卷：建硬链接
-            for (_r, n2, p2, r2, _v) in members:
-                if r2 == n2:
-                    continue
-                lk = os.path.join(root, r2)
-                if os.path.exists(lk):
-                    continue
-                try:
-                    os.link(p2, lk)
-                except OSError:
-                    shutil.copy2(p2, lk)
-                links.append(lk)
-            open_path = os.path.join(root, real)
-        else:
-            open_path = path
-        items.append((os.path.relpath(open_path, inbox), open_path, sources + links))
-
-    # 伪装成媒体文件的包（如 xxx.mp4 实为尾部反转 zip）
-    for fp in disguised:
-        items.append((os.path.relpath(fp, inbox), fp, [fp]))
-    return _drop_duplicates(items)
+def read_passwords(inbox: str) -> list[str]:
+    """读取可用密码（与图形界面共用 app.passwords 的实现）。"""
+    from app.passwords import PasswordStore
+    store = PasswordStore(os.path.join(inbox, PASSWORD_FILE), inbox)
+    return store.get()
 
 
-def _file_digest(path: str, chunk: int = 8 << 20) -> str:
-    import hashlib
+def parse_part(name: str):
+    """解析文件名 -> (base, volume_no)。
+
+    volume_no 为 None 表示名字里没有卷号（可能是首卷，也可能是单文件包）。
+      '218.花柒Hana.7z.7z.001.pdf' -> ('218.花柒Hana.7z.7z', 1)
+      '26.7z.001删'                -> ('26.7z', 1)
+      'rizunya.7z.002'             -> ('rizunya.7z', 2)
+      '26.7z'                      -> ('26.7z', None)
+      'video.mp4'                  -> (None, None)
+    """
+    m = _PART_RE.match(name)
+    if not m:
+        return None, None
+    base = m.group("base")
+    vol = m.group("vol")
+    return base, (int(vol[1:]) if vol else None)
+
+
+def _digest(path: str, chunk: int = 8 << 20) -> str:
     h = hashlib.md5()
     with open(path, "rb") as f:
         while True:
@@ -184,13 +106,132 @@ def _file_digest(path: str, chunk: int = 8 << 20) -> str:
     return h.hexdigest()
 
 
-def _drop_duplicates(items: list) -> list:
-    """同一内容的多个副本只保留一个。
+def _dedup(paths: list[str]) -> tuple[list[str], list[tuple[str, str]]]:
+    """按内容去重，返回 (保留的路径, [(被丢弃的, 保留的)])。"""
+    keep: list[str] = []
+    dups: list[tuple[str, str]] = []
+    seen: dict[tuple[int, str], str] = {}
+    for p in paths:
+        try:
+            sz = os.path.getsize(p)
+            dg = _digest(p)
+        except OSError:
+            continue
+        key = (sz, dg)
+        if key in seen:
+            dups.append((p, seen[key]))
+        else:
+            seen[key] = p
+            keep.append(p)
+    return keep, dups
 
-    浏览器重复下载会生成 "xxx(1).mp4" 这种文件，内容与原件完全相同。
-    不处理的话同一份资源会被解压两遍、归档两份，白白浪费时间和空间。
-    只在文件大小相同时才做完整比对，避免无谓的读盘。
+
+def _link_into(dirpath: str, src: str, canonical: str) -> str:
+    """在 dirpath 下建一个名为 canonical 的入口指向 src。
+
+    优先硬链接（同盘瞬时完成、不占空间），失败则退回复制。
     """
+    dst = os.path.join(dirpath, canonical)
+    if os.path.exists(dst):
+        try:
+            if os.path.samefile(dst, src):
+                return dst
+        except OSError:
+            pass
+        try:
+            os.chmod(dst, 0o666)
+            os.remove(dst)
+        except OSError:
+            pass
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
+    return dst
+
+
+def collect(inbox: str):
+    """扫描收件箱，返回 [(标签, 待打开路径, 源文件列表)]。
+
+    分卷会跨文件夹归组，并在暂存区建一套规范命名的入口，这样即使
+    首卷丢了卷号、卷号后面带杂字、各卷分散在不同目录，7-Zip 也能解。
+    """
+    parts: dict[str, dict] = {}      # base -> {vol_or_None: [paths]}
+    disguised: list[str] = []        # 伪装成媒体文件的包
+
+    for root, dirs, files in os.walk(inbox):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        for name in sorted(files):
+            if name.endswith(".qkdownloading"):
+                continue
+            p = os.path.join(root, name)
+            base, vol = parse_part(name)
+            if base is None:
+                # 名字不像压缩包：可能是尾部反转 / 追加型伪装
+                if os.path.splitext(name)[1].lower() in _MEDIA_EXT:
+                    try:
+                        if detect(p).kind in ("tail_reversed", "appended"):
+                            disguised.append(p)
+                    except Exception:
+                        pass
+                continue
+            parts.setdefault(base, {}).setdefault(vol, []).append(p)
+
+    items: list[tuple[str, str, list[str]]] = []
+    links_dir = os.path.join(STAGING, "_parts")
+
+    for base, volmap in sorted(parts.items()):
+        numbered = sorted(v for v in volmap if v)
+        all_paths = [p for lst in volmap.values() for p in lst]
+
+        # 没有第二卷及以上 -> 当成独立包逐个处理
+        if not any(v >= 2 for v in numbered):
+            keep, dups = _dedup(all_paths)
+            if dups:
+                log(f"  (跳过 {len(dups)} 个重复副本)")
+            for p in keep:
+                items.append((os.path.relpath(p, inbox), p, [p]))
+            continue
+
+        # 分卷：确定每一卷用哪个文件
+        maxv = max(numbered)
+        chosen: dict[int, str] = {}
+        # 第一卷：优先带 .001 的，没有就用无卷号的那个
+        first_pool = volmap.get(1) or volmap.get(None) or []
+        if first_pool:
+            keep, _ = _dedup(first_pool)
+            if keep:
+                chosen[1] = keep[0]
+        for v in numbered:
+            if v < 2:
+                continue
+            keep, _ = _dedup(volmap[v])
+            if keep:
+                chosen[v] = keep[0]
+
+        missing = [v for v in range(1, maxv + 1) if v not in chosen]
+        if missing:
+            log(f"  !! {base} 缺少分卷 {missing}，跳过")
+            continue
+
+        os.makedirs(links_dir, exist_ok=True)
+        try:
+            entries = [_link_into(links_dir, chosen[v], f"{base}.{v:03d}")
+                       for v in sorted(chosen)]
+        except Exception as exc:
+            log(f"  !! {base} 建立分卷入口失败: {exc}")
+            continue
+        items.append((f"{base}（{len(chosen)} 卷）", entries[0], all_paths))
+
+    # 伪装成媒体文件的包
+    for fp in disguised:
+        items.append((os.path.relpath(fp, inbox), fp, [fp]))
+
+    return _drop_duplicates(items)
+
+
+def _drop_duplicates(items: list) -> list:
+    """同一内容的多个副本只保留一个（浏览器重复下载会产生 "xxx(1)"）。"""
     by_size: dict[int, list] = {}
     for it in items:
         try:
@@ -205,15 +246,15 @@ def _drop_duplicates(items: list) -> list:
         if len(group) == 1:
             keep.extend(group)
             continue
-        seen: dict[str, str] = {}       # digest -> 保留的标签
+        seen: dict[str, str] = {}
         for it in group:
             try:
-                dg = _file_digest(it[1])
+                dg = _digest(it[1])
             except OSError:
                 keep.append(it)
                 continue
             if dg in seen:
-                dups.append((it[0], seen[dg]))   # (重复项, 原件)
+                dups.append((it[0], seen[dg]))
             else:
                 seen[dg] = it[0]
                 keep.append(it)
@@ -239,7 +280,8 @@ def main() -> int:
     os.makedirs(staging_dir, exist_ok=True)
 
     items = collect(inbox)
-    log(f"收件箱 {inbox}：待处理 {len(items)} 个，可用密码 {len(passwords)} 个")
+    log(f"收件箱 {inbox}：待处理 {len(items)} 个，可用密码 {len(passwords)} 个"
+        + (f"（{'、'.join(passwords)}）" if passwords else ""))
     if not items:
         log("没有需要处理的压缩包。")
         return 0
@@ -256,60 +298,58 @@ def main() -> int:
         shutil.rmtree(outdir, ignore_errors=True)
         shutil.rmtree(workdir, ignore_errors=True)
 
-        res = pipe.process(open_path, workdir, outdir, passwords, recurse=True)
+        log(f"=== [{i}/{len(items)}] {label} ===")
+        res = pipe.process(open_path, workdir, outdir, passwords, recurse=True,
+                           log=lambda m: log("   " + m))
         if not res.ok:
-            log(f"[{i}/{len(items)}] {label}  !! 失败: {res.error}")
+            log(f"   !! 失败: {res.error}")
             fail_n += 1
             continue
 
-        # 安全闸门 1：解压结果必须"像样"。全是 0 字节或体积远小于源包，
-        # 说明解压不完整或是空壳包，此时绝不能删源文件。
-        files_in_out = res.files
-        bytes_in_out = res.bytes_
-        src_total = sum(os.path.getsize(s) for s in dict.fromkeys(sources) if os.path.exists(s))
-        suspicious = []
-        if files_in_out == 0:
-            suspicious.append("没有解出任何文件")
-        if bytes_in_out < 1024 * 1024 and src_total > 10 * 1024 * 1024:
-            suspicious.append(f"解出内容仅 {bytes_in_out} 字节，源包却有 {human(src_total)}")
-        if src_total and bytes_in_out < src_total * 0.01:
-            suspicious.append(f"解出体积不足源包的 1%")
-
-        # 安全闸门 2：归档不能有遗留
-        if suspicious:
-            log(f"[{i}/{len(items)}] {label}  !! 解压结果可疑，保留源文件不删除:")
-            for s in suspicious:
-                log(f"       - {s}")
+        # 闸门 1：解压结果必须像样（防止把空壳当成功、进而误删源）
+        src_total = sum(os.path.getsize(s) for s in dict.fromkeys(sources)
+                        if os.path.exists(s))
+        bad = []
+        if res.files == 0:
+            bad.append("没有解出任何文件")
+        if res.bytes_ < 1024 * 1024 and src_total > 10 * 1024 * 1024:
+            bad.append(f"解出仅 {res.bytes_} 字节，源包却有 {human(src_total)}")
+        if src_total and res.bytes_ < src_total * 0.01:
+            bad.append("解出体积不足源包的 1%")
+        if bad:
+            log("   !! 解压结果可疑，保留源文件不删除:")
+            for b in bad:
+                log(f"       - {b}")
             fail_n += 1
             continue
 
+        # 闸门 2：归档不能有遗留
+        works: list[dict] = []
         try:
-            works: list[dict] = []
-            moved, mbytes, errors = pipe.archive_by_type(outdir, dest, move=True,
-                                                        works_out=works)
+            moved, mbytes, errors = pipe.archive_by_type(
+                outdir, dest, move=True, works_out=works,
+                log=lambda m: log("   " + m))
         except Exception as exc:
-            log(f"[{i}/{len(items)}] {label}  !! 归档异常: {exc}")
+            log(f"   !! 归档异常: {exc}")
             fail_n += 1
             continue
-
         if errors:
-            keep_dir = os.path.join(staging_dir, "kept", os.path.basename(label))
+            keep_dir = os.path.join(staging_dir, "kept", label.replace(os.sep, "_"))
             os.makedirs(os.path.dirname(keep_dir), exist_ok=True)
-            if os.path.isdir(keep_dir):
-                shutil.rmtree(keep_dir, ignore_errors=True)
+            shutil.rmtree(keep_dir, ignore_errors=True)
             try:
                 shutil.move(outdir, keep_dir)
                 where = keep_dir
             except Exception:
                 where = outdir
-            log(f"[{i}/{len(items)}] {label}  !! 有 {len(errors)} 个文件未能归档，"
-                f"已保留在 {where}，源压缩包未删除")
+            log(f"   !! {len(errors)} 个文件未能归档，已保留在 {where}，源包未删除")
             for e in errors[:5]:
-                log(f"      {e}")
+                log(f"       {e}")
             fail_n += 1
             continue
 
-        # 默认保留源文件；只有显式 --delete-source 且全部检查通过才删除
+        all_works.extend(works)
+
         if delete_source:
             for s in dict.fromkeys(sources):
                 try:
@@ -320,18 +360,16 @@ def main() -> int:
                     os.remove(s)
                 except OSError:
                     pass
-            log(f"[{i}/{len(items)}] {label}  -> {files_in_out} 个文件 / "
-                f"{human(bytes_in_out)}  {time.time()-t0:.0f}s  (源包已删除)")
-        else:
-            log(f"[{i}/{len(items)}] {label}  -> {files_in_out} 个文件 / "
-                f"{human(bytes_in_out)}  {time.time()-t0:.0f}s  (源包保留)")
-        all_works.extend(works)
+
+        detail = "，".join(f"{w['kind']} {w['files']}" for w in works[:4])
+        log(f"   -> {res.files} 个文件 / {human(res.bytes_)}  "
+            f"[{time.time()-t0:.0f}s]  {detail}"
+            + ("  源包已删除" if delete_source else ""))
         ok_n += 1
 
     shutil.rmtree(staging_dir, ignore_errors=True)
     log(f"完成：成功 {ok_n}，失败 {fail_n}，总用时 {time.time()-t_all:.0f}s")
 
-    # 记录这次归档了什么，供"一键查看刚解压的"
     if all_works:
         try:
             from app import recent
@@ -340,7 +378,6 @@ def main() -> int:
             pass
 
     if ok_n:
-        # 刷新检索清单，方便之后找图
         try:
             import importlib
             idx = importlib.import_module("建索引")

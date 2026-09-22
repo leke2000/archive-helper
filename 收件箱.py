@@ -63,43 +63,16 @@ def _read_text(path: str) -> str | None:
 
 
 def read_passwords(inbox: str) -> list[str]:
-    """密码来源：
-      1) 解压密码.txt —— 每行一个（本工具维护的清单）
-      2) 收件箱里任何 .txt 中出现 '密码:xxx' 的自动提取
-    这样下载自带的说明文件也能直接用，无需手工登记。
+    """读取可用密码。
+
+    统一走 app.passwords.PasswordStore，和图形界面共用一套逻辑：
+      1) 收件目录的密码文件（本工具维护，每行一个）
+      2) 收件目录里任何 .txt 中出现 "密码:xxx" 的内容
+      3) 以「密码」开头的目录名
     """
-    pws: list[str] = []
-
-    def add(s: str) -> None:
-        s = s.strip().strip('"\'')
-        if s and s not in pws:
-            pws.append(s)
-
-    p = os.path.join(inbox, PASSWORD_FILE)
-    if os.path.isfile(p):
-        text = _read_text(p)
-        if text:
-            for line in text.splitlines():
-                s = line.strip()
-                if s and "密码" not in s:
-                    add(s)
-
-    for name in sorted(os.listdir(inbox)):
-        if not name.lower().endswith(".txt") or name == PASSWORD_FILE:
-            continue
-        text = _read_text(os.path.join(inbox, name))
-        if not text or "密码" not in text:
-            continue
-        for m in _PW_RE.finditer(text):
-            add(m.group(1))
-
-    # 子目录名里也可能写着密码，例如 "解压密码：xiaohutao"
-    for root, dirs, _files in os.walk(inbox):
-        for d in dirs:
-            if "密码" in d:
-                for m in _PW_RE.finditer(d):
-                    add(m.group(1))
-    return pws
+    from app.passwords import PasswordStore
+    store = PasswordStore(os.path.join(inbox, PASSWORD_FILE), inbox)
+    return store.get()
 
 
 def normalize(name: str):

@@ -24,6 +24,23 @@ VID_EXT = {".mp4", ".mov", ".mkv", ".avi", ".wmv", ".flv", ".webm", ".m4v",
 
 ARCHIVE_EXT = (".7z", ".zip", ".rar", ".001", ".z01")
 
+# 7-Zip 在密码不正确时的提示（中英文都覆盖）
+_WRONG_PW_MARKERS = (
+    "wrong password", "invalid password", "密码错误", "密码不正确",
+    "data error in encrypted file",
+)
+
+
+def _looks_like_wrong_password(output: str) -> bool:
+    low = (output or "").lower()
+    return any(m in low for m in _WRONG_PW_MARKERS)
+
+
+def _looks_encrypted(list_output: str) -> bool:
+    """7-Zip 列出加密压缩包时会带上这些标记。"""
+    low = (list_output or "").lower()
+    return ("encrypted" in low or "aes" in low or "加密" in list_output)
+
 
 @dataclass
 class Result:
@@ -75,20 +92,40 @@ class Pipeline:
                     pass
         return files, total
 
-    def _try_passwords(self, path: str, passwords: Iterable[str]):
-        """Yield (password, ok, out) for the first password that opens the archive."""
+    def _resolve_passwords(self, passwords) -> list[str]:
+        """passwords 可以是列表，也可以是个可调用对象。
+
+        传可调用对象时，每次尝试密码都会重新取值 —— 这就是"热加载"：
+        界面里新加的密码对后续压缩包（以及正在处理的队列）立刻生效。
+        """
+        try:
+            vals = passwords() if callable(passwords) else passwords
+        except Exception:
+            return []
+        return [str(v) for v in (vals or []) if str(v).strip()]
+
+    def _try_passwords(self, path: str, passwords):
+        """逐个尝试密码，产出所有"能打开"的候选。
+
+        注意：加密的 7z 即使密码错误也能列出文件头，所以这里不能一遇到
+        list 成功就认定密码对 —— 把候选都交给上层用 test 判定。密码文件里
+        通常只有几个候选，成本可以接受。
+        """
         seen = set()
-        for pw in passwords:
+        for pw in self._resolve_passwords(passwords):
             if pw in seen:
                 continue
             seen.add(pw)
             ok, _atype, out = self.sz.list(path, pw)
             if ok:
                 yield pw, True, out
-                return
-            # an unencrypted archive opens with no password
+
+        # 未加密的包：空密码也能列出内容，此时 test 应当通过。
+        # 但如果这是个加密包（list 输出里带加密标记），空密码就是无效候选，
+        # 不要让它去走"数据损坏"的抢救流程。
         ok, _atype, out = self.sz.list(path, None)
-        yield None, ok, out
+        if ok and not _looks_encrypted(out):
+            yield None, True, out
 
     # -- main --------------------------------------------------------------
     @staticmethod
@@ -113,7 +150,7 @@ class Pipeline:
         source: str,
         workdir: str,
         outdir: str,
-        passwords: list[str],
+        passwords: "list[str] | Callable[[], list[str]]",
         log: LogFn = lambda m: None,
         progress: ProgressFn | None = None,
         recurse: bool = True,
@@ -145,7 +182,13 @@ class Pipeline:
             for pw, ok, _out in self._try_passwords(archive, passwords):
                 if not ok:
                     continue
-                good, _tout = self.sz.test(archive, pw)
+                good, tout = self.sz.test(archive, pw)
+                # 密码错和数据坏都会让 test 失败，但处理方式完全不同：
+                #   - 密码错：赶紧换下一个密码，别浪费时间抢救
+                #   - 数据坏：才是下载不完整，值得尝试抢救
+                if not good and _looks_like_wrong_password(tout):
+                    log(f"密码 {pw or '无'} 不正确，继续尝试其他密码")
+                    continue
                 pw_used = pw
                 tested = good
                 if good:
@@ -154,7 +197,7 @@ class Pipeline:
                     break
                 # 数据校验失败通常是下载不完整（有零区）。仍然尝试解压，
                 # 能救出多少算多少，只是内容可能不完整。
-                res.add(f"密码 {pw} 可打开但数据校验失败（可能下载不完整）")
+                res.add(f"密码 {pw} 正确，但数据校验失败（可能下载不完整）")
                 log(res.steps[-1])
                 salvaged = True
 
@@ -223,7 +266,7 @@ class Pipeline:
                 return kind
         return None
 
-    def _extract_nested(self, root: str, passwords: list[str], log: LogFn):
+    def _extract_nested(self, root: str, passwords, log: LogFn):
         """解开解压结果里嵌套的压缩包。
 
         三层保险避免漏解：

@@ -101,7 +101,7 @@ def run_auto(
     src_dir: str,
     staging: str,
     dest: str,
-    passwords: list[str],
+    passwords,
     move: bool = True,
     keep_source: bool = False,
     only: list[str] | None = None,

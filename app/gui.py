@@ -18,6 +18,7 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+from . import recent
 from .passwords import DEFAULT_PASSWORD_FILE, PasswordStore
 from .pipeline import Pipeline
 from .sevenzip import SevenZip, find_7za
@@ -150,18 +151,23 @@ class App(tk.Tk):
         ttk.Checkbutton(opt, text="归档成功后删除源压缩包（建议先确认结果再勾选）",
                         variable=self.inbox_del_var).grid(row=1, column=0, columnspan=2,
                                                           sticky="w", padx=6, pady=(0, 6))
+        self.auto_open_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opt, text="处理完自动打开刚解压的内容",
+                        variable=self.auto_open_var).grid(row=2, column=0, columnspan=2,
+                                                          sticky="w", padx=6, pady=(0, 6))
 
         run = ttk.Frame(root)
         run.pack(fill="x", padx=PAD, pady=PAD)
-        self.inbox_btn = ttk.Button(run, text="扫描并处理", command=self._run_inbox)
+        self.inbox_btn = ttk.Button(run, text="一键处理", command=self._run_inbox)
         self.inbox_btn.pack(side="left")
         ttk.Button(run, text="预览待处理", command=self._preview_inbox).pack(side="left", padx=6)
+        ttk.Button(run, text="查看刚解压的", command=self._open_recent).pack(side="left", padx=(0, 6))
         self.stop_btn = ttk.Button(run, text="停止", command=self._request_stop, state="disabled")
         self.stop_btn.pack(side="left")
 
         ttk.Label(root,
-                  text="说明：自动识别伪装包（mp4/jpg 外观）、分卷、加密、内层套娃，"
-                       "按 图片/视频/其他 分类归档。",
+                  text="一键处理 = 扫描收件目录 → 解压（含套娃）→ 分类归档 → 刷新清单 → "
+                       "自动打开刚解压的内容。",
                   foreground="#666", wraplength=940, justify="left").pack(anchor="w", padx=PAD)
 
     # -- 解压 --------------------------------------------------------------
@@ -372,6 +378,15 @@ class App(tk.Tk):
         self.stop_btn.configure(state="disabled")
 
     # -- 收件箱任务 --------------------------------------------------------
+    def _open_recent(self):
+        """打开最近一次解压的内容（图片优先用看图软件）。"""
+        try:
+            from . import recent
+            msg = recent.open_latest()
+        except Exception as exc:
+            msg = f"打开失败: {exc}"
+        self.write(msg)
+
     def _preview_inbox(self):
         try:
             import importlib
@@ -434,6 +449,7 @@ class App(tk.Tk):
             pws = self.pw_store.get
 
             ok_n = fail_n = 0
+            all_works: list[dict] = []
             for i, (label, open_path, sources) in enumerate(items, 1):
                 if self.stop_flag.is_set():
                     self.log_q.put(("log", "已停止。"))
@@ -473,9 +489,11 @@ class App(tk.Tk):
 
                 # 归档
                 try:
+                    works: list[dict] = []
                     moved, mbytes, errors = pipe.archive_by_type(
                         outdir, dest, move=True,
-                        log=lambda m: self.log_q.put(("log", "  " + m)))
+                        log=lambda m: self.log_q.put(("log", "  " + m)),
+                        works_out=works)
                 except Exception as exc:
                     self.log_q.put(("log", f"  !! 归档异常: {exc}"))
                     fail_n += 1
@@ -498,6 +516,7 @@ class App(tk.Tk):
                             os.remove(s)
                         except OSError:
                             pass
+                all_works.extend(works)
                 self.log_q.put(("log", f"  -> {res.files} 个文件 / {_human(res.bytes_)}"
                                        + ("  (源包已删除)" if del_source else "  (源包保留)")))
                 ok_n += 1
@@ -505,12 +524,27 @@ class App(tk.Tk):
             shutil.rmtree(staging, ignore_errors=True)
             self.log_q.put(("log", f"完成：成功 {ok_n}，失败 {fail_n}"))
 
+            # 记录本次结果，供"查看刚解压的"
+            if all_works:
+                try:
+                    recent.record(dest, all_works)
+                except Exception:
+                    pass
+
             # 刷新检索清单
             try:
                 idx = importlib.import_module("建索引")
                 idx.main_quiet(dest)
             except Exception as exc:
                 self.log_q.put(("log", f"清单生成失败（不影响解压）: {exc}"))
+
+            # 一键：处理完直接把刚解压的打开
+            if all_works and self.auto_open_var.get():
+                self.log_q.put(("log", "正在打开刚解压的内容..."))
+                try:
+                    self.log_q.put(("log", recent.open_latest()))
+                except Exception as exc:
+                    self.log_q.put(("log", f"打开失败: {exc}"))
         except Exception as exc:
             self.log_q.put(("log", f"致命错误: {type(exc).__name__}: {exc}"))
         finally:

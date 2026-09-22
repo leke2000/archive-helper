@@ -348,6 +348,7 @@ class Pipeline:
         progress: ProgressFn | None = None,
         skip_dirs: set[str] | None = None,
         include_other: bool = True,
+        works_out: list[dict] | None = None,
     ) -> tuple[int, int, list[str]]:
         """把 src_root 下的文件分类搬到目标目录。
 
@@ -360,6 +361,8 @@ class Pipeline:
         """
         skip_dirs = skip_dirs or set()
         plan: list[tuple[str, str]] = []  # (src, dest)
+        # 记录每个作品目录的去向与统计，供"一键查看刚解压的"用
+        works: dict[tuple[str, str], list[int]] = {}
 
         def plan_tree(top_name: str, dir_path: str):
             for r, _d, fs in os.walk(dir_path):
@@ -377,6 +380,13 @@ class Pipeline:
                     else:
                         continue
                     plan.append((fp, os.path.join(dest_root, bucket, top_name, sub)))
+                    key = (bucket, top_name)
+                    e = works.setdefault(key, [0, 0])
+                    e[0] += 1
+                    try:
+                        e[1] += os.path.getsize(fp)
+                    except OSError:
+                        pass
 
         for name in sorted(os.listdir(src_root)):
             p = os.path.join(src_root, name)
@@ -395,6 +405,13 @@ class Pipeline:
                 else:
                     continue
                 plan.append((p, os.path.join(dest_root, bucket, name)))
+                key = (bucket, name)
+                e = works.setdefault(key, [0, 0])
+                e[0] += 1
+                try:
+                    e[1] += os.path.getsize(p)
+                except OSError:
+                    pass
 
         total = len(plan)
         if total == 0:
@@ -471,6 +488,18 @@ class Pipeline:
         if leftover:
             errors.append(f"未能归档的文件 {len(leftover)} 个（保留在暂存区）: "
                           + ", ".join(os.path.basename(x) for x in leftover[:5]))
+
+        # 把"这次归档了什么"回传给调用方（供一键查看刚解压的用）
+        if works_out is not None:
+            for (bucket, top_name), (cnt, tot) in sorted(
+                    works.items(), key=lambda kv: (kv[0][0], kv[0][1])):
+                works_out.append({
+                    "kind": bucket,
+                    "name": top_name,
+                    "path": os.path.join(dest_root, bucket, top_name),
+                    "files": cnt,
+                    "bytes": tot,
+                })
 
         log(f"归档完成: {moved} 个文件, {moved_bytes/1048576:.1f} MB"
             + (f", {len(errors)} 个问题" if errors else ""))

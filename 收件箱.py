@@ -193,6 +193,7 @@ def main() -> int:
 
     pipe = Pipeline(SevenZip(), salvage=True)
     ok_n = fail_n = 0
+    all_works: list[dict] = []
     t_all = time.time()
 
     for i, (label, open_path, sources) in enumerate(items, 1):
@@ -230,7 +231,9 @@ def main() -> int:
             continue
 
         try:
-            moved, mbytes, errors = pipe.archive_by_type(outdir, dest, move=True)
+            works: list[dict] = []
+            moved, mbytes, errors = pipe.archive_by_type(outdir, dest, move=True,
+                                                        works_out=works)
         except Exception as exc:
             log(f"[{i}/{len(items)}] {label}  !! 归档异常: {exc}")
             fail_n += 1
@@ -269,20 +272,29 @@ def main() -> int:
         else:
             log(f"[{i}/{len(items)}] {label}  -> {files_in_out} 个文件 / "
                 f"{human(bytes_in_out)}  {time.time()-t0:.0f}s  (源包保留)")
+        all_works.extend(works)
         ok_n += 1
 
     shutil.rmtree(staging_dir, ignore_errors=True)
     log(f"完成：成功 {ok_n}，失败 {fail_n}，总用时 {time.time()-t_all:.0f}s")
 
+    # 记录这次归档了什么，供"一键查看刚解压的"
+    if all_works:
+        try:
+            from app import recent
+            recent.record(dest, all_works)
+        except Exception:
+            pass
+
     if ok_n:
-        # 刷新画廊索引，方便之后找图
+        # 刷新检索清单，方便之后找图
         try:
             import importlib
             idx = importlib.import_module("建索引")
-            log("更新画廊索引...")
+            log("更新检索清单...")
             idx.main_quiet(dest)
         except Exception as exc:
-            log(f"索引生成失败（不影响解压）: {exc}")
+            log(f"清单生成失败（不影响解压）: {exc}")
 
     return 0 if fail_n == 0 else 1
 

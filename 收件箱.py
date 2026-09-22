@@ -169,7 +169,60 @@ def collect(inbox: str):
     # 伪装成媒体文件的包（如 xxx.mp4 实为尾部反转 zip）
     for fp in disguised:
         items.append((os.path.relpath(fp, inbox), fp, [fp]))
-    return items
+    return _drop_duplicates(items)
+
+
+def _file_digest(path: str, chunk: int = 8 << 20) -> str:
+    import hashlib
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(chunk)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def _drop_duplicates(items: list) -> list:
+    """同一内容的多个副本只保留一个。
+
+    浏览器重复下载会生成 "xxx(1).mp4" 这种文件，内容与原件完全相同。
+    不处理的话同一份资源会被解压两遍、归档两份，白白浪费时间和空间。
+    只在文件大小相同时才做完整比对，避免无谓的读盘。
+    """
+    by_size: dict[int, list] = {}
+    for it in items:
+        try:
+            sz = os.path.getsize(it[1])
+        except OSError:
+            continue
+        by_size.setdefault(sz, []).append(it)
+
+    keep: list = []
+    dups: list = []
+    for sz, group in by_size.items():
+        if len(group) == 1:
+            keep.extend(group)
+            continue
+        seen: dict[str, str] = {}       # digest -> 保留的标签
+        for it in group:
+            try:
+                dg = _file_digest(it[1])
+            except OSError:
+                keep.append(it)
+                continue
+            if dg in seen:
+                dups.append((it[0], seen[dg]))   # (重复项, 原件)
+            else:
+                seen[dg] = it[0]
+                keep.append(it)
+
+    if dups:
+        log(f"发现 {len(dups)} 个重复副本，已跳过：")
+        for dup, orig in dups:
+            log(f"   {dup}  ==  {orig}")
+    return keep
 
 
 def main() -> int:

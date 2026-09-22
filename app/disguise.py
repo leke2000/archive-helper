@@ -133,22 +133,90 @@ def detect(path: str) -> Detection:
     if d is not None:
         return d
 
-    # --- appended archive: scan for a signature inside the file ---
+    # --- appended archive: 从媒体结构结束处往后找最外层的包 ---
+    start = _media_end(path, size) or 0
+    best: tuple[int, bytes] | None = None
     for sig in ARCHIVE_SIGS:
-        off = _find_signature(path, sig)
+        off = _find_signature(path, sig, start=start)
         if off is not None and off > 0:
-            return Detection(
-                "appended", off, off, _sig_name(sig),
-                [f"archive signature at offset {off}"],
-            )
+            if best is None or off < best[0]:
+                best = (off, sig)
+    if best is not None:
+        off, sig = best
+        notes = [f"archive signature at offset {off}"]
+        if start:
+            notes.append(f"媒体结构结束于 {start}")
+        return Detection("appended", off, off, _sig_name(sig), notes)
 
     return Detection("plain", 0, 0, "", ["no disguise detected"])
 
 
-def _find_signature(path: str, sig: bytes, chunk: int = 8 << 20, max_hits: int = 1):
-    """Return the first offset of sig, or None. Streams the file."""
+def _media_end(path: str, size: int, limit: int = 64) -> int | None:
+    """若文件以媒体容器开头，返回其结构结束的偏移。
+
+    用于定位"媒体 + 附加压缩包"这类伪装：从媒体结束处往后找，
+    才能找到最外层的那个包。返回 None 表示不是可解析的媒体容器。
+    """
+    head = _read_head(path, 16)
+    if len(head) < 16:
+        return None
+
+    # MP4 / MOV：顶层 box 链（ftyp → moov → mdat …）
+    if head[4:8] == b"ftyp":
+        pos = 0
+        with open(path, "rb") as f:
+            for _ in range(limit):
+                if pos + 8 > size:
+                    break
+                f.seek(pos)
+                h = f.read(16)
+                if len(h) < 8:
+                    break
+                s = struct.unpack(">I", h[:4])[0]
+                t = h[4:8]
+                hl = 8
+                if s == 1:
+                    if len(h) < 16:
+                        break
+                    s = struct.unpack(">Q", h[8:16])[0]
+                    hl = 16
+                elif s == 0:
+                    s = size - pos
+                if s < hl or pos + s > size or not all(32 <= c < 127 for c in t):
+                    return pos
+                pos += s
+        return pos
+
+    # JPEG：找 EOI 标记
+    if head[:2] == b"\xff\xd8":
+        with open(path, "rb") as f:
+            base = 0
+            carry = b""
+            while True:
+                buf = f.read(8 << 20)
+                if not buf:
+                    return None
+                data = carry + buf
+                i = data.rfind(b"\xff\xd9")
+                if i >= 0 and data[i + 2:].strip(b"\x00") == b"":
+                    return base - len(carry) + i + 2
+                carry = data[-1:]
+                base += len(buf)
+
+    # PNG：找 IEND 块
+    if head[:8] == b"\x89PNG\r\n\x1a\n":
+        off = _find_signature(path, b"IEND")
+        if off is not None:
+            return off + 8
+    return None
+
+
+def _find_signature(path: str, sig: bytes, chunk: int = 8 << 20, max_hits: int = 1,
+                    start: int = 0):
+    """Return the first offset of sig at/after *start*, or None. Streams the file."""
     with open(path, "rb") as f:
-        base = 0
+        f.seek(start)
+        base = start
         carry = b""
         while True:
             buf = f.read(chunk)

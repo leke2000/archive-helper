@@ -71,7 +71,12 @@ def latest() -> dict | None:
             data = json.load(f)
     except (OSError, ValueError):
         return None
-    items = [it for it in data.get("items", []) if os.path.isdir(it.get("path", ""))]
+
+    def alive(p: str) -> bool:
+        # 作品可能是目录（图集），也可能是单个文件（一个视频）
+        return bool(p) and (os.path.isdir(p) or os.path.isfile(p))
+
+    items = [it for it in data.get("items", []) if alive(it.get("path", ""))]
     if not items:
         return None
     data["items"] = items

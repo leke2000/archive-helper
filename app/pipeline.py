@@ -37,9 +37,20 @@ def _looks_like_wrong_password(output: str) -> bool:
 
 
 def _looks_encrypted(list_output: str) -> bool:
-    """7-Zip 列出加密压缩包时会带上这些标记。"""
-    low = (list_output or "").lower()
-    return ("encrypted" in low or "aes" in low or "加密" in list_output)
+    """判断 7-Zip 列表输出对应的包是否加密。
+
+    注意不能用 "encrypted" 做简单子串匹配 —— `-slt` 格式里每条记录都有
+    `Encrypted = -`（表示"未加密"），简单匹配会把所有包都误判成加密。
+    """
+    out = list_output or ""
+    if "Encrypted = +" in out:      # 7-Zip 用 + / - 表示 是 / 否
+        return True
+    low = out.lower()
+    # 压缩方法里出现这些算法即说明加密
+    for kw in ("7zaes", "aes-256", "aes-128", "aes-192", "zipcrypto", "pkware"):
+        if kw in low:
+            return True
+    return False
 
 
 @dataclass

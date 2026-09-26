@@ -29,6 +29,7 @@
 python 一键.py                 # 一键处理并打开
 python 一键.py --no-open       # 处理但不打开
 python 一键.py --delete-source # 成功后删除源压缩包
+python 一键.py --redo          # 无视处理记录，强制重来
 ```
 
 ## 快速使用（收件箱模式）

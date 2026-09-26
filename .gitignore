@@ -13,5 +13,9 @@ _staging/
 *_processed.txt
 *.log
 
+# 本机状态（源文件路径与处理记录，换机器会自动重建）
+_done.json
+_recent.json
+
 # 本地发布脚本（含个人仓库信息）
 _publish.py

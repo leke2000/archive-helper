@@ -26,8 +26,39 @@ SIG_RAR5 = b"Rar!\x1a\x07\x01\x00"
 SIG_RAR4 = b"Rar!\x1a\x07\x00"
 SIG_ZIP_LOCAL = b"PK\x03\x04"
 SIG_ZIP_EOCD = b"PK\x05\x06"
+SIG_GZIP = b"\x1f\x8b\x08"
 
 ARCHIVE_SIGS = (SIG_7Z, SIG_RAR5, SIG_RAR4, SIG_ZIP_LOCAL)
+
+# 容器类型 -> 建议的扩展名（用于给去掉扩展名的压缩包起个好名字）
+CONTAINER_EXT = {
+    "gzip": ".gz",
+    "7z": ".7z",
+    "zip": ".zip",
+    "rar": ".rar",
+}
+
+
+def sniff_container(path: str) -> str | None:
+    """按文件头判断容器类型，不依赖文件名。
+
+    资源站常把扩展名整个去掉（如 "课件196" 实为 gzip、"617" 实为 7z），
+    只看后缀会完全漏掉这些文件。返回 'gzip'/'7z'/'zip'/'rar' 或 None。
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(8)
+    except OSError:
+        return None
+    if head.startswith(SIG_7Z):
+        return "7z"
+    if head[:2] == SIG_GZIP[:2] and len(head) >= 3 and head[2] == SIG_GZIP[2]:
+        return "gzip"
+    if head.startswith(SIG_RAR5) or head.startswith(SIG_RAR4):
+        return "rar"
+    if head.startswith(SIG_ZIP_LOCAL):
+        return "zip"
+    return None
 
 # media signatures used to recognise a decoy header
 MEDIA_SIGS = (
@@ -72,7 +103,33 @@ def _sig_name(buf: bytes) -> str:
         return "rar4"
     if buf.startswith(SIG_ZIP_LOCAL):
         return "zip"
+    if buf.startswith(SIG_GZIP):
+        return "gz"
     return ""
+
+
+def is_incomplete_7z(path: str) -> bool:
+    """判断是不是"缺后续分卷"的 7z 首卷。
+
+    7z 起始头里记录了整个流的大小（nextHeaderOffset + nextHeaderSize）。
+    如果文件实际比它小，说明还有后续分卷没到 —— 此时应该把文件名
+    规范成 .7z.001，让 7-Zip 去找 .002。
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(32)
+    except OSError:
+        return False
+    if len(head) < 32 or not head.startswith(SIG_7Z):
+        return False
+    try:
+        nho, nhs = struct.unpack("<QQ", head[12:28])
+    except struct.error:
+        return False
+    if nho == 0 or nhs == 0:
+        return False
+    total = 32 + nho + nhs
+    return total > os.path.getsize(path)
 
 
 def _looks_like_media(head: bytes) -> bool:

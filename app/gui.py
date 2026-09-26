@@ -440,6 +440,18 @@ class App(tk.Tk):
                 self.log_q.put(("log", "收件箱里没有待处理的压缩包。"))
                 return
 
+            # 已经解压归档过的包不再重复处理
+            items, skipped, done = inbox_mod.filter_done(items)
+            if skipped:
+                self.log_q.put(("log", f"已有 {len(skipped)} 个包处理过，自动跳过："))
+                for it in skipped[:5]:
+                    self.log_q.put(("log", f"   - {it[0]}"))
+                if len(skipped) > 5:
+                    self.log_q.put(("log", f"   ... 另外 {len(skipped) - 5} 个"))
+            if not items:
+                self.log_q.put(("log", "没有新的需要处理的压缩包。"))
+                return
+
             self.log_q.put(("log", f"收件箱 {inbox}：待处理 {len(items)} 个"))
             staging = os.path.join(inbox_mod.STAGING, "_gui")
             os.makedirs(staging, exist_ok=True)
@@ -516,12 +528,14 @@ class App(tk.Tk):
                             os.remove(s)
                         except OSError:
                             pass
+                inbox_mod.mark_done(done, sources)
                 all_works.extend(works)
                 self.log_q.put(("log", f"  -> {res.files} 个文件 / {_human(res.bytes_)}"
                                        + ("  (源包已删除)" if del_source else "  (源包保留)")))
                 ok_n += 1
 
             shutil.rmtree(staging, ignore_errors=True)
+            inbox_mod._save_done(done)
             self.log_q.put(("log", f"完成：成功 {ok_n}，失败 {fail_n}"))
 
             # 记录本次结果，供"查看刚解压的"

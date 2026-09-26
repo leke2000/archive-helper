@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+# Windows 上用 py / python 启动即可（这行原来是 shebang，会害 py.exe 找错解释器）
 """一键处理：扫描收件箱 -> 解压 -> 分类归档 -> 刷新清单 -> 打开刚解压的。
 
 用法：
@@ -74,6 +74,20 @@ def main() -> int:
             print(recent.open_latest())
         return 0
 
+    items, skipped, done = inbox_mod.filter_done(items, redo="--redo" in sys.argv)
+    if skipped:
+        print(f"已有 {len(skipped)} 个包解压归档过，自动跳过（--redo 可强制重来）：")
+        for it in skipped[:8]:
+            print(f"  · {it[0]}")
+        if len(skipped) > 8:
+            print(f"  · ... 另外 {len(skipped) - 8} 个")
+    if not items:
+        print("没有新的需要处理的压缩包。")
+        if open_when_done:
+            print()
+            print(recent.open_latest())
+        return 0
+
     print(f"待处理 {len(items)} 个：")
     for label, _p, srcs in items:
         print(f"  · {label}" + (f"（{len(srcs)} 个文件）" if len(srcs) > 1 else ""))
@@ -134,6 +148,7 @@ def main() -> int:
             continue
 
         all_works.extend(works)
+        inbox_mod.mark_done(done, sources)
 
         if delete_source:
             for s in dict.fromkeys(sources):
@@ -162,6 +177,7 @@ def main() -> int:
     print(f"完成：成功 {ok_n}，失败 {fail_n}，总用时 {time.time()-t_all:.0f}s")
     if failed:
         print("未成功：" + "、".join(failed))
+    inbox_mod._save_done(done)
 
     # 刷新检索清单
     if ok_n:

@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+# Windows 上用 py / python 启动即可（这行原来是 shebang，会害 py.exe 找错解释器）
 """收件箱模式：扫描目录，自动识别伪装/分卷/加密压缩包，解压并分类归档。
 
 用法（在 解压助手 目录下）:
@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -33,7 +34,7 @@ import time
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 
-from app.disguise import detect
+from app.disguise import detect, sniff_container, is_incomplete_7z, CONTAINER_EXT
 from app.pipeline import Pipeline
 from app.sevenzip import SevenZip
 
@@ -41,6 +42,10 @@ DEFAULT_INBOX = r"D:\dowm"
 DEFAULT_DEST = r"H:\赏花阁"
 PASSWORD_FILE = "解压密码.txt"
 STAGING = r"D:\_staging"
+
+# 处理成功过的源文件记录（路径 -> 大小:修改时间），避免重复解压已归档的包。
+# 重新下载同一个包会刷新修改时间，那时会正常再处理一遍。
+DONE_FILE = os.path.join(_HERE, "_done.json")
 
 # 这些目录不是收件箱（工具自身、已解压好的游戏），递归时跳过
 SKIP_DIRS = {
@@ -56,6 +61,16 @@ _PART_RE = re.compile(r"^(?P<base>.*\.(?:7z|zip|rar))(?P<vol>\.\d{3})?(?P<tail>.
 # 名字像媒体 -> 可能是伪装包
 _MEDIA_EXT = {".mp4", ".mov", ".mkv", ".ts", ".jpg", ".jpeg", ".png", ".pdf",
               ".avi", ".webm", ".m4v", ".gif", ".webp"}
+
+# 这些扩展名已有明确含义，不必再按文件头猜（其中 docx/xlsx/pptx/apk 本身就是 zip，
+# 猜了反而会误判成压缩包）
+_KNOWN_EXT = _MEDIA_EXT | {
+    ".txt", ".url", ".lnk", ".pptx", ".docx", ".xlsx", ".doc", ".xls", ".ppt",
+    ".exe", ".dll", ".sys", ".msi", ".apk", ".ipa", ".jar", ".py", ".js", ".json",
+    ".csv", ".log", ".ini", ".cfg", ".bat", ".cmd", ".ps1", ".sh", ".html", ".htm",
+    ".css", ".xml", ".md", ".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".psd",
+    ".ttf", ".otf", ".ico", ".svg", ".db", ".sqlite", ".iso", ".img",
+}
 
 
 def log(msg: str) -> None:
@@ -158,6 +173,7 @@ def collect(inbox: str):
     """
     parts: dict[str, dict] = {}      # base -> {vol_or_None: [paths]}
     disguised: list[str] = []        # 伪装成媒体文件的包
+    sniffed: list[tuple[str, str]] = []   # (源路径, 补齐后的名字)
 
     for root, dirs, files in os.walk(inbox):
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
@@ -167,18 +183,41 @@ def collect(inbox: str):
             p = os.path.join(root, name)
             base, vol = parse_part(name)
             if base is None:
+                ext = os.path.splitext(name)[1].lower()
                 # 名字不像压缩包：可能是尾部反转 / 追加型伪装
-                if os.path.splitext(name)[1].lower() in _MEDIA_EXT:
+                if ext in _MEDIA_EXT:
                     try:
                         if detect(p).kind in ("tail_reversed", "appended"):
                             disguised.append(p)
+                            continue
                     except Exception:
                         pass
+                # 扩展名不认识（含完全没有扩展名）：按文件头猜
+                # 例：课件196 == gzip，617 == 7z
+                if ext not in _KNOWN_EXT:
+                    kind = sniff_container(p)
+                    if kind:
+                        sniffed.append((p, name + CONTAINER_EXT[kind]))
                 continue
             parts.setdefault(base, {}).setdefault(vol, []).append(p)
 
     items: list[tuple[str, str, list[str]]] = []
     links_dir = os.path.join(STAGING, "_parts")
+
+    # 无扩展名 / 未知扩展名的包：建一个带正确后缀的入口再解
+    if sniffed:
+        os.makedirs(links_dir, exist_ok=True)
+    for src, target_name in sniffed:
+        if target_name.lower().endswith(".7z") and is_incomplete_7z(src):
+            # 缺后续分卷的 7z 首卷，补成 .001 让 7-Zip 按分卷去找
+            target_name += ".001"
+        try:
+            entry = _link_into(links_dir, src, target_name)
+        except Exception as exc:
+            log(f"  !! {os.path.basename(src)} 建立入口失败: {exc}")
+            continue
+        items.append((f"{os.path.relpath(src, inbox)}（按文件头识别为 {os.path.splitext(target_name)[1].lstrip('.')}）",
+                      entry, [src]))
 
     for base, volmap in sorted(parts.items()):
         numbered = sorted(v for v in volmap if v)
@@ -266,9 +305,61 @@ def _drop_duplicates(items: list) -> list:
     return keep
 
 
+def _sig(path: str) -> str:
+    """源文件的"指纹"：大小 + 修改时间。重新下载会改变它。"""
+    st = os.stat(path)
+    return f"{st.st_size}:{int(st.st_mtime)}"
+
+
+def filter_done(items: list, redo: bool = False, done: dict | None = None):
+    """滤掉已经解压归档过的包，返回 (待处理, 已跳过, 记录表)。
+
+    重新下载同一个包会刷新修改时间，那时会照常再处理一遍。
+    """
+    if done is None:
+        done = {} if redo else _load_done()
+    keep, skipped = [], []
+    for it in items:
+        srcs = [s for s in dict.fromkeys(it[2]) if os.path.exists(s)]
+        if srcs and all(done.get(s) == _sig(s) for s in srcs):
+            skipped.append(it)
+        else:
+            keep.append(it)
+    return keep, skipped, done
+
+
+def mark_done(done: dict, sources) -> None:
+    """记下这些源文件已经处理成功（只在归档成功后才该调用）。"""
+    for s in dict.fromkeys(sources):
+        try:
+            done[s] = _sig(s)
+        except OSError:
+            pass
+
+
+def _load_done() -> dict:
+    try:
+        with open(DONE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_done(done: dict) -> None:
+    try:
+        tmp = DONE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(done, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, DONE_FILE)
+    except OSError as exc:
+        log(f"  (处理记录写入失败: {exc})")
+
+
 def main() -> int:
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     delete_source = "--delete-source" in sys.argv
+    ignore_done = "--redo" in sys.argv
     inbox = args[0] if len(args) > 0 else DEFAULT_INBOX
     dest = args[1] if len(args) > 1 else DEFAULT_DEST
 
@@ -284,6 +375,18 @@ def main() -> int:
         + (f"（{'、'.join(passwords)}）" if passwords else ""))
     if not items:
         log("没有需要处理的压缩包。")
+        return 0
+
+    done = {} if ignore_done else _load_done()
+    items, skipped, done = filter_done(items, ignore_done, done)
+    if skipped:
+        log(f"已有 {len(skipped)} 个包解压归档过，自动跳过（--redo 可强制重来）：")
+        for it in skipped[:8]:
+            log(f"   {it[0]}")
+        if len(skipped) > 8:
+            log(f"   ... 另外 {len(skipped) - 8} 个")
+    if not items:
+        log("没有新的需要处理的压缩包。")
         return 0
 
     pipe = Pipeline(SevenZip(), salvage=True)
@@ -350,6 +453,8 @@ def main() -> int:
 
         all_works.extend(works)
 
+        mark_done(done, sources)
+
         if delete_source:
             for s in dict.fromkeys(sources):
                 try:
@@ -368,6 +473,8 @@ def main() -> int:
         ok_n += 1
 
     shutil.rmtree(staging_dir, ignore_errors=True)
+    if not ignore_done:
+        _save_done(done)
     log(f"完成：成功 {ok_n}，失败 {fail_n}，总用时 {time.time()-t_all:.0f}s")
 
     if all_works:

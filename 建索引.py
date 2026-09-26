@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+# Windows 上用 py / python 启动即可（这行原来是 shebang，会害 py.exe 找错解释器）
 """为归档目录生成检索清单，方便快速找到想看的资源。
 
 用法:

@@ -36,6 +36,28 @@ def _looks_like_wrong_password(output: str) -> bool:
     return any(m in low for m in _WRONG_PW_MARKERS)
 
 
+# 缺少后续分卷时 7-Zip 的报错，和"密码错/数据坏"完全不同，要分开告诉用户
+_INCOMPLETE_MARKERS = (
+    "unexpected end of archive",
+    "cannot open the file as",
+    "can not open the file as",
+)
+
+
+def _looks_incomplete(output: str) -> bool:
+    low = (output or "").lower()
+    return any(m in low for m in _INCOMPLETE_MARKERS)
+
+
+def _next_volume_hint(archive: str) -> str:
+    """缺分卷时给一句人话提示，指出下一个该来的分卷叫什么。"""
+    low = archive.lower()
+    if low.endswith(".001"):
+        return (f"缺少后续分卷（如 {os.path.basename(archive)[:-4]}.002）；"
+                "同一套的所有分卷要放在一起才能解压")
+    return "压缩包不完整：缺少后续分卷，或下载没完成"
+
+
 def _looks_encrypted(list_output: str) -> bool:
     """判断 7-Zip 列表输出对应的包是否加密。
 
@@ -190,13 +212,14 @@ class Pipeline:
             pw_used = None
             tested = False
             salvaged = False
+            incomplete = disguise.is_incomplete_7z(archive)
             for pw, ok, _out in self._try_passwords(archive, passwords):
-                if not ok:
-                    continue
                 good, tout = self.sz.test(archive, pw)
                 # 密码错和数据坏都会让 test 失败，但处理方式完全不同：
                 #   - 密码错：赶紧换下一个密码，别浪费时间抢救
                 #   - 数据坏：才是下载不完整，值得尝试抢救
+                if not good and _looks_incomplete(tout):
+                    incomplete = True
                 if not good and _looks_like_wrong_password(tout):
                     log(f"密码 {pw or '无'} 不正确，继续尝试其他密码")
                     continue
@@ -213,7 +236,11 @@ class Pipeline:
                 salvaged = True
 
             if not tested and not (salvaged and self.salvage):
-                res.error = "无法通过完整性校验（密码错误或文件损坏）"
+                # 缺分卷常被误报成"密码错误"，这里单独说清楚
+                if incomplete:
+                    res.error = _next_volume_hint(archive)
+                else:
+                    res.error = "无法通过完整性校验（密码错误或文件损坏）"
                 log("错误: " + res.error)
                 return res
             if not tested:
@@ -266,15 +293,19 @@ class Pipeline:
         """按文件头判断是不是压缩包，忽略扩展名。
 
         有些资源会把内层包改名（如 .7z删除、.bin），只看后缀会漏掉。
+        tar 的签名在偏移 257（"ustar"），所以要多读一点。
         """
         try:
             with open(path, "rb") as f:
-                head = f.read(8)
+                head = f.read(512)
         except OSError:
             return None
         for magic, kind in cls._ARCH_MAGIC:
             if head.startswith(magic):
                 return kind
+        # 裸 tar（.gz 解出来的一层，里面往往还套着加密 7z）
+        if len(head) >= 262 and head[257:262] == b"ustar":
+            return "tar"
         return None
 
     def _extract_nested(self, root: str, passwords, log: LogFn):
@@ -283,8 +314,9 @@ class Pipeline:
         三层保险避免漏解：
           1) 分卷 (.001/.z01 ...)
           2) 有压缩包后缀 (.7z/.zip/.rar)
-          3) 上述都没有时，按文件头嗅探（应对 .7z删除 / .bin 这类改名）
-        每轮扫描一次，最多三轮，避免无限递归。
+          3) 上述都没有时，按文件头嗅探（应对 .7z删除 / .bin / 裸 tar 这类改名）
+        每轮扫描一次，最多三轮，避免无限递归。注意 .gz 解出来的是裸 tar，
+        里面通常还套着加密 7z，所以第 3 层必须认 tar 才接得上。
         """
         for _ in range(3):
             volumes = []

@@ -34,6 +34,7 @@ import time
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 
+from app import cleanup
 from app.disguise import detect, sniff_container, is_incomplete_7z, CONTAINER_EXT
 from app.pipeline import Pipeline
 from app.sevenzip import SevenZip
@@ -45,31 +46,44 @@ STAGING = r"D:\_staging"
 
 # 处理成功过的源文件记录（路径 -> 大小:修改时间），避免重复解压已归档的包。
 # 重新下载同一个包会刷新修改时间，那时会正常再处理一遍。
-DONE_FILE = os.path.join(_HERE, "_done.json")
+DONE_FILE = cleanup.DONE_FILE
 
-# 这些目录不是收件箱（工具自身、已解压好的游戏），递归时跳过
+# 密码不对（含文件头加密）的包会被移到这里，免得每次跑都白试一遍
+PENDING_DIR = "_待补密码"
+PENDING_LIST = "待补密码清单.txt"
+
+# 这些目录不是收件箱（工具自身、已解压好的游戏、密码待补的包），递归时跳过
 SKIP_DIRS = {
     "解压助手",
     "$RECYCLE.BIN",
     "System Volume Information",
     "《碧蓝航线》本地一键端",
+    PENDING_DIR,
 }
 
 # 形如 <base>.001 / <base>.002 ... ，后面允许跟杂字（如 "26.7z.001删"）
 _PART_RE = re.compile(r"^(?P<base>.*\.(?:7z|zip|rar))(?P<vol>\.\d{3})?(?P<tail>.*)$",
                       re.IGNORECASE)
+# 剥包名尾巴用：归档后缀 / 伪装后缀 / 分卷号
+_TAIL_RE = re.compile(
+    r"\.(?:7z|zip|rar|zst|gz|tar|pdf|mp4|mov|mkv|avi|webm|jpg|jpeg|png|gif|webp"
+    r"|\d{3}|z\d{2})$", re.IGNORECASE)
 # 名字像媒体 -> 可能是伪装包
 _MEDIA_EXT = {".mp4", ".mov", ".mkv", ".ts", ".jpg", ".jpeg", ".png", ".pdf",
               ".avi", ".webm", ".m4v", ".gif", ".webp"}
 
-# 这些扩展名已有明确含义，不必再按文件头猜（其中 docx/xlsx/pptx/apk 本身就是 zip，
-# 猜了反而会误判成压缩包）
+# 这些扩展名已有明确含义，不必再按文件头猜（其中 docx/epub/apk 本身就是 zip，
+# 猜了反而会误判成压缩包、把电子书文档拆散）
 _KNOWN_EXT = _MEDIA_EXT | {
     ".txt", ".url", ".lnk", ".pptx", ".docx", ".xlsx", ".doc", ".xls", ".ppt",
     ".exe", ".dll", ".sys", ".msi", ".apk", ".ipa", ".jar", ".py", ".js", ".json",
     ".csv", ".log", ".ini", ".cfg", ".bat", ".cmd", ".ps1", ".sh", ".html", ".htm",
     ".css", ".xml", ".md", ".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".psd",
     ".ttf", ".otf", ".ico", ".svg", ".db", ".sqlite", ".iso", ".img",
+    # 电子书 / 文档容器
+    ".epub", ".mobi", ".azw", ".azw3", ".fb2", ".cbz", ".cbr", ".djvu",
+    ".odt", ".ods", ".odp", ".docm", ".xlsm", ".pptm", ".xpi", ".vsix",
+    ".whl", ".nupkg", ".appx",
 }
 
 
@@ -86,9 +100,16 @@ def human(n: float) -> str:
 
 
 def read_passwords(inbox: str) -> list[str]:
-    """读取可用密码（与图形界面共用 app.passwords 的实现）。"""
-    from app.passwords import PasswordStore
-    store = PasswordStore(os.path.join(inbox, PASSWORD_FILE), inbox)
+    """读取可用密码（与图形界面共用 app.passwords 的实现）。
+
+    收件目录里没有 解压密码.txt 时（比如单独跑 _待补密码 目录），
+    回退到默认密码本，不要变成"一个密码都没有"。
+    """
+    from app.passwords import PasswordStore, DEFAULT_PASSWORD_FILE
+    path = os.path.join(inbox, PASSWORD_FILE)
+    if not os.path.isfile(path) and os.path.isfile(DEFAULT_PASSWORD_FILE):
+        path = DEFAULT_PASSWORD_FILE
+    store = PasswordStore(path, inbox)
     return store.get()
 
 
@@ -110,14 +131,31 @@ def parse_part(name: str):
     return base, (int(vol[1:]) if vol else None)
 
 
+_SAMPLE_MIN = 8 << 20          # 小于这个尺寸就全读
+_SAMPLE_PIECE = 1 << 20        # 抽样时每段读 1MB
+
+
 def _digest(path: str, chunk: int = 8 << 20) -> str:
+    """内容指纹，用于去重。
+
+    大于 8MB 的文件只抽 头/中/尾 各 1MB + 文件大小 来比对：重复下载的副本
+    是逐字节相同的，抽样足够分辨；而整读一个 3GB 的包要十几秒，抽样只要
+    几十毫秒。同尺寸、不同内容、又恰好三处抽样全撞上的概率可以忽略。
+    """
+    sz = os.path.getsize(path)
     h = hashlib.md5()
+    h.update(str(sz).encode())
     with open(path, "rb") as f:
-        while True:
-            b = f.read(chunk)
-            if not b:
-                break
-            h.update(b)
+        if sz <= _SAMPLE_MIN:
+            while True:
+                b = f.read(chunk)
+                if not b:
+                    break
+                h.update(b)
+            return h.hexdigest()
+        for off in (0, max(0, sz // 2 - _SAMPLE_PIECE // 2), sz - _SAMPLE_PIECE):
+            f.seek(off)
+            h.update(f.read(_SAMPLE_PIECE))
     return h.hexdigest()
 
 
@@ -305,61 +343,127 @@ def _drop_duplicates(items: list) -> list:
     return keep
 
 
-def _sig(path: str) -> str:
-    """源文件的"指纹"：大小 + 修改时间。重新下载会改变它。"""
-    st = os.stat(path)
-    return f"{st.st_size}:{int(st.st_mtime)}"
-
-
-def filter_done(items: list, redo: bool = False, done: dict | None = None):
-    """滤掉已经解压归档过的包，返回 (待处理, 已跳过, 记录表)。
-
-    重新下载同一个包会刷新修改时间，那时会照常再处理一遍。
-    """
-    if done is None:
-        done = {} if redo else _load_done()
-    keep, skipped = [], []
-    for it in items:
-        srcs = [s for s in dict.fromkeys(it[2]) if os.path.exists(s)]
-        if srcs and all(done.get(s) == _sig(s) for s in srcs):
-            skipped.append(it)
-        else:
-            keep.append(it)
-    return keep, skipped, done
-
-
-def mark_done(done: dict, sources) -> None:
-    """记下这些源文件已经处理成功（只在归档成功后才该调用）。"""
-    for s in dict.fromkeys(sources):
-        try:
-            done[s] = _sig(s)
-        except OSError:
-            pass
+# 处理记录相关的实现在 app/cleanup.py（界面和"清理源包"共用同一份逻辑）
+_sig = cleanup.sig
+filter_done = cleanup.filter_done
+mark_done = cleanup.mark_done
 
 
 def _load_done() -> dict:
-    try:
-        with open(DONE_FILE, encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
-        return {}
+    return cleanup.load_done(DONE_FILE)
 
 
 def _save_done(done: dict) -> None:
+    cleanup.save_done(done, DONE_FILE, log=log, merge=True)
+
+
+def _pending_name(label: str, sources: list[str]) -> str:
+    """给"密码待补"的包起个干净的文件夹名。
+
+    从源文件名一层层剥掉归档/伪装尾巴：
+    `339.艾西Aiwest.7z.001.pdf` -> `339.艾西Aiwest`，
+    `猫和老鼠1.mp4` -> `猫和老鼠1`，`ba469.7z.001` -> `ba469`。
+    """
+    raw = os.path.basename(sources[0]) if sources else ""
+    if not raw:
+        raw = os.path.basename(label.replace(os.sep, "_")) or "未命名"
+        if "（" in raw:
+            raw = raw.split("（")[0]
+    name = raw
+    while True:
+        stripped = _TAIL_RE.sub("", name, count=1)
+        if stripped == name or not stripped:
+            break
+        name = stripped
+    if not name:
+        name = os.path.splitext(raw)[0] or raw
+    name = re.sub(r'[\\/:\*\?"<>|]', "_", name).strip(" .")
+    return name or "未命名"
+
+
+def _under_pending(path: str) -> bool:
+    """这个路径是否已经在某个 _待补密码 目录下面。"""
+    p = os.path.abspath(path)
+    while True:
+        p, name = os.path.split(p)
+        if not name:
+            return False
+        if name == PENDING_DIR:
+            return True
+
+
+def move_to_pending(inbox: str, label: str, sources: list[str]) -> str:
+    """密码未知的源包挪进 <收件箱>\\_待补密码\\<包名>\\，返回落点。
+
+    已经在 _待补密码 里的（例如直接跑那个目录）不再套一层，返回空串。
+    """
+    if any(_under_pending(s) for s in sources):
+        return ""                       # 已经在待补目录里，别再套一层
+    root = os.path.join(inbox, PENDING_DIR)
+    name = _pending_name(label, sources)
+    dest = os.path.join(root, name)
+    n = 2
+    while os.path.exists(dest):
+        dest = os.path.join(root, f"{name}-{n}")
+        n += 1
+    os.makedirs(dest, exist_ok=True)
+    for s in dict.fromkeys(sources):
+        if not os.path.exists(s):
+            continue
+        target = os.path.join(dest, os.path.basename(s))
+        try:
+            os.replace(s, target)       # 同盘：瞬间改名
+        except OSError:
+            try:
+                shutil.move(s, target)
+            except (OSError, shutil.Error) as exc:
+                log(f"   !! 移不动 {s}: {exc}")
+    return dest
+
+
+def write_pending_list(inbox: str) -> str:
+    """把 _待补密码 里的包列成清单，方便随时看还缺哪些密码。"""
+    root = os.path.join(inbox, PENDING_DIR)
+    if not os.path.isdir(root):
+        # 收件箱本身就是 _待补密码 目录时，就写在这里
+        if os.path.basename(os.path.abspath(inbox)) == PENDING_DIR:
+            root = os.path.abspath(inbox)
+        else:
+            return ""
+    rows = []
+    for name in sorted(os.listdir(root)):
+        d = os.path.join(root, name)
+        if not os.path.isdir(d):
+            continue
+        files = [f for f in os.listdir(d) if f != PENDING_LIST]
+        total = 0
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(d, f))
+            except OSError:
+                pass
+        rows.append((name, len(files), total))
+    path = os.path.join(root, PENDING_LIST)
     try:
-        tmp = DONE_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(done, f, ensure_ascii=False, indent=1)
-        os.replace(tmp, DONE_FILE)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("# 解压密码未知的包（补上密码后，可用:\n")
+            f.write(f"#   收件箱.py \"{root}\" <归档目录>\n")
+            f.write("# 重新处理）\n")
+            f.write(f"# 更新于 {time.strftime('%Y-%m-%d %H:%M')}\n\n")
+            f.write(f"{'包名':<40} {'文件数':>6} {'体积':>10}\n")
+            f.write("-" * 60 + "\n")
+            for name, cnt, total in rows:
+                f.write(f"{name:<40} {cnt:>6} {human(total):>10}\n")
     except OSError as exc:
-        log(f"  (处理记录写入失败: {exc})")
+        log(f"  !! 清单写入失败: {exc}")
+    return path
 
 
 def main() -> int:
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     delete_source = "--delete-source" in sys.argv
     ignore_done = "--redo" in sys.argv
+    no_pending = "--no-pending" in sys.argv
     inbox = args[0] if len(args) > 0 else DEFAULT_INBOX
     dest = args[1] if len(args) > 1 else DEFAULT_DEST
 
@@ -390,7 +494,7 @@ def main() -> int:
         return 0
 
     pipe = Pipeline(SevenZip(), salvage=True)
-    ok_n = fail_n = 0
+    ok_n = fail_n = pending_n = 0
     all_works: list[dict] = []
     t_all = time.time()
 
@@ -407,6 +511,13 @@ def main() -> int:
         if not res.ok:
             log(f"   !! 失败: {res.error}")
             fail_n += 1
+            if res.reason == "password" and not no_pending:
+                # 密码未知的包挪到一起，免得每次跑都白试一遍密码
+                where = move_to_pending(inbox, label, sources)
+                if where:
+                    pending_n += 1
+                    log(f"   -> 已移入 {where}")
+                    log(f"      （补上密码后跑：收件箱.py \"{os.path.join(inbox, PENDING_DIR)}\" \"{dest}\"）")
             continue
 
         # 闸门 1：解压结果必须像样（防止把空壳当成功、进而误删源）
@@ -431,6 +542,7 @@ def main() -> int:
         try:
             moved, mbytes, errors = pipe.archive_by_type(
                 outdir, dest, move=True, works_out=works,
+                group=_pending_name(label, sources),
                 log=lambda m: log("   " + m))
         except Exception as exc:
             log(f"   !! 归档异常: {exc}")
@@ -456,15 +568,11 @@ def main() -> int:
         mark_done(done, sources)
 
         if delete_source:
-            for s in dict.fromkeys(sources):
-                try:
-                    os.chmod(s, 0o666)
-                except OSError:
-                    pass
-                try:
-                    os.remove(s)
-                except OSError:
-                    pass
+            # 送回收站而不是直接抹掉，删错了还能捞回来
+            from app import trash
+            ok_del, bad_del = trash.delete(dict.fromkeys(sources), to_trash=True)
+            for s in bad_del:
+                log(f"   !! 源包删不掉: {s}")
 
         detail = "，".join(f"{w['kind']} {w['files']}" for w in works[:4])
         log(f"   -> {res.files} 个文件 / {human(res.bytes_)}  "
@@ -476,6 +584,11 @@ def main() -> int:
     if not ignore_done:
         _save_done(done)
     log(f"完成：成功 {ok_n}，失败 {fail_n}，总用时 {time.time()-t_all:.0f}s")
+    if pending_n:
+        lst = write_pending_list(inbox)
+        log(f"密码未知的 {pending_n} 个包已移入 {os.path.join(inbox, PENDING_DIR)}"
+            + (f"（清单：{lst}）" if lst else ""))
+        log(f"补上密码后跑：收件箱.py \"{os.path.join(inbox, PENDING_DIR)}\" \"{dest}\"")
 
     if all_works:
         try:

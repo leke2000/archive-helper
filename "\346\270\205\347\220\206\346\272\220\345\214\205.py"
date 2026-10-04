@@ -1,0 +1,76 @@
+# Windows 上用 py / python 启动即可（这行原来是 shebang，会害 py.exe 找错解释器）
+"""一键删除：把已经解压归档好的源压缩包清掉，腾出空间。
+
+用法：
+    清理源包.py              # 列出并删除（默认送回收站，删错能捞回来）
+    清理源包.py --dry-run    # 只看会删哪些，不动手
+    清理源包.py --permanent  # 不进回收站，直接删（快，但不可恢复）
+
+删谁、不删谁：
+    只删"处理记录（_done.json）里仍然存在、且大小+修改时间都没变"的文件 ——
+    也就是确实解压归档成功过、之后也没被重新下载过的源包。
+    没解开过的（比如密码还缺的）不会碰。
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _HERE)
+
+from app import cleanup
+
+
+def human(n: float) -> str:
+    for u in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024:
+            return f"{n:.1f}{u}"
+        n /= 1024
+    return f"{n:.1f}PB"
+
+
+def main() -> int:
+    dry_run = "--dry-run" in sys.argv
+    to_trash = "--permanent" not in sys.argv
+
+    print("=" * 60)
+    print("清理已解压的源压缩包")
+    print(f"  记录文件 {cleanup.DONE_FILE}")
+    print(f"  删除方式 {'送回收站（可恢复）' if to_trash else '直接删除（不可恢复）'}")
+    print("=" * 60)
+
+    items, stale = cleanup.scan_cleanable()
+    if not items:
+        print("没有可删的源包（记录里没有、或文件已经不在了）。")
+        if stale:
+            print(f"（清理了 {len(stale)} 条过期记录）")
+            done = cleanup.load_done()
+            for p in stale:
+                done.pop(p, None)
+            cleanup.save_done(done)
+        return 0
+
+    total = sum(it["size"] for it in items)
+    print(f"可删 {len(items)} 个包，共 {human(total)}：")
+    for it in items:
+        print(f"  {human(it['size']):>10}  {it['path']}")
+    print()
+
+    if dry_run:
+        print("（--dry-run：只是看看，没删）")
+        return 0
+
+    res = cleanup.clean_sources(to_trash=to_trash, log=lambda m: print(m))
+    print()
+    print(f"已删除 {res['count']} 个包，释放 {human(res['bytes'])}")
+    if res["errors"]:
+        print("删不掉这些（可能被占用）：")
+        for p in res["errors"]:
+            print("   ", p)
+    return 0 if not res["errors"] else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

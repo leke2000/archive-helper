@@ -15,12 +15,15 @@ from dataclasses import dataclass, field
 from typing import Callable, Iterable
 
 from . import disguise
-from .sevenzip import SevenZip
+from .sevenzip import SevenZip, engine_supports_rar5
 
 IMG_EXT = {".jpg", ".jpeg", ".jfif", ".png", ".gif", ".webp", ".bmp",
            ".tif", ".tiff", ".avif", ".heic", ".heif", ".jpe"}
 VID_EXT = {".mp4", ".mov", ".mkv", ".avi", ".wmv", ".flv", ".webm", ".m4v",
            ".ts", ".m2ts", ".rmvb", ".mpg", ".mpeg", ".3gp", ".vob", ".rm", ".f4v"}
+# 电子书：这些本身是 zip/rar 容器（epub/cbz），拆开就没法阅读了，
+# 所以归档进 书籍/，套娃解压时也要跳过它们
+BOOK_EXT = {".epub", ".mobi", ".azw", ".azw3", ".fb2", ".cbz", ".cbr", ".djvu"}
 
 ARCHIVE_EXT = (".7z", ".zip", ".rar", ".001", ".z01")
 
@@ -64,6 +67,12 @@ def _locked_headers_hint(archive: str) -> str:
             "（分卷本身是齐的）")
 
 
+def _no_rar_engine_hint(archive: str) -> str:
+    return ("这台机器的解压引擎不支持 RAR5（精简版 7za.exe 打不开 RAR5，"
+            "会伪装成\"文件损坏\"）。把完整版 7-Zip 的 7z.exe 和 7z.dll "
+            "放进程序的 bin 目录即可")
+
+
 def _looks_encrypted(list_output: str) -> bool:
     """判断 7-Zip 列表输出对应的包是否加密。
 
@@ -90,6 +99,11 @@ class Result:
     bytes_: int = 0
     steps: list[str] = field(default_factory=list)
     error: str = ""
+    # 失败原因，给上层做判断用（别去猜 error 文案）：
+    #   "password"       密码不对（含文件头加密）
+    #   "missing_volume" 缺后续分卷 / 下载不完整
+    #   "corrupt"        数据损坏
+    reason: str = ""
 
     def add(self, msg: str):
         self.steps.append(msg)
@@ -116,20 +130,15 @@ class Pipeline:
             return "image"
         if e in VID_EXT:
             return "video"
+        if e in BOOK_EXT:
+            return "book"
         return None
 
-    @staticmethod
-    def _dir_stats(root: str) -> tuple[int, int]:
-        files = 0
-        total = 0
-        for r, _d, fs in os.walk(root):
-            for f in fs:
-                files += 1
-                try:
-                    total += os.path.getsize(os.path.join(r, f))
-                except OSError:
-                    pass
-        return files, total
+    @classmethod
+    def _dir_stats(cls, root: str) -> tuple[int, int]:
+        """(文件数, 总字节)。和 _scan_tree 同一套 scandir 逻辑。"""
+        info = cls._scan_tree(root)
+        return len(info), sum(info.values())
 
     def _resolve_passwords(self, passwords) -> list[str]:
         """passwords 可以是列表，也可以是个可调用对象。
@@ -251,12 +260,21 @@ class Pipeline:
             if not tested and not (salvaged and self.salvage):
                 # 缺分卷常被误报成"密码错误"，反过来头部加密也常被当成"文件损坏"，
                 # 这里按真正的原因给话
+                unsupported = (disguise.sniff_container(archive) == "rar"
+                               and not engine_supports_rar5(self.sz.exe))
                 if incomplete:
                     res.error = _next_volume_hint(archive, missing)
+                    res.reason = "missing_volume"
                 elif wrong_pw or locked:
                     res.error = _locked_headers_hint(archive)
+                    res.reason = "password"
+                elif unsupported:
+                    # 精简版 7za 打不开 RAR5，报错和"文件损坏"一模一样，要分开说
+                    res.error = _no_rar_engine_hint(archive)
+                    res.reason = "no_engine"
                 else:
                     res.error = "无法通过完整性校验（密码错误或文件损坏）"
+                    res.reason = "corrupt"
                 log("错误: " + res.error)
                 return res
             if not tested:
@@ -271,13 +289,25 @@ class Pipeline:
                 files_now, _ = self._dir_stats(outdir)
                 if files_now == 0:
                     res.error = "解压失败"
+                    res.reason = "missing_volume" if incomplete else "corrupt"
                     log("错误: " + res.error)
                     return res
                 log(f"解压报告异常，但已恢复 {files_now} 个文件")
 
             # recurse into any nested volumes (salvage path needs this too)
             if recurse:
-                self._extract_nested(outdir, passwords, log)
+                leftovers = self._extract_nested(outdir, passwords, log)
+                if leftovers:
+                    # 内层还有没解开的包：整包按"缺密码"处理，等补齐再来，
+                    # 不然归档出去的是个打不开的空壳
+                    names = "、".join(os.path.basename(p) for p in leftovers[:3])
+                    if len(leftovers) > 3:
+                        names += f" 等 {len(leftovers)} 个"
+                    res.error = (f"内层还有包没解开（多半缺密码）：{names}；"
+                                 "密码补齐后重跑即可")
+                    res.reason = "password"
+                    log("错误: " + res.error)
+                    return res
 
             if tmp_archive and os.path.exists(tmp_archive):
                 os.remove(tmp_archive)
@@ -293,6 +323,7 @@ class Pipeline:
 
         except Exception as exc:  # keep the GUI alive
             res.error = f"{type(exc).__name__}: {exc}"
+            res.reason = "error"
             log("异常: " + res.error)
             return res
 
@@ -303,6 +334,15 @@ class Pipeline:
         (b"Rar!\x1a\x07\x01\x00", "rar"),
         (b"Rar!\x1a\x07\x00", "rar"),
     )
+
+    # 这些"本质是压缩包"的文档不能当套娃解：epub/cbz 是电子书、
+    # apk/docx 是安装包和文档，拆开就毁了（epub 拆完只剩一堆 html）
+    _KEEP_INTACT_EXT = {
+        ".epub", ".mobi", ".azw", ".azw3", ".fb2", ".cbz", ".cbr", ".djvu",
+        ".docx", ".xlsx", ".pptx", ".docm", ".xlsm", ".pptm", ".odt", ".ods",
+        ".odp", ".apk", ".jar", ".ipa", ".msi", ".xpi", ".vsix", ".whl",
+        ".nupkg", ".appx", ".iso",
+    }
 
     @classmethod
     def _sniff_archive(cls, path: str) -> str | None:
@@ -324,7 +364,7 @@ class Pipeline:
             return "tar"
         return None
 
-    def _extract_nested(self, root: str, passwords, log: LogFn):
+    def _extract_nested(self, root: str, passwords, log: LogFn) -> list[str]:
         """解开解压结果里嵌套的压缩包。
 
         三层保险避免漏解：
@@ -333,7 +373,12 @@ class Pipeline:
           3) 上述都没有时，按文件头嗅探（应对 .7z删除 / .bin / 裸 tar 这类改名）
         每轮扫描一次，最多三轮，避免无限递归。注意 .gz 解出来的是裸 tar，
         里面通常还套着加密 7z，所以第 3 层必须认 tar 才接得上。
+
+        返回"没能解开的内层包"（缺密码、加密头、或解出来是空的）。
+        这类包不能当成功：否则外层会被归档，用户只拿到一个打不开的空壳，
+        比直接报错还坑。
         """
+        leftovers: list[str] = []
         for _ in range(3):
             volumes = []
             named = []
@@ -343,6 +388,8 @@ class Pipeline:
                     low = f.lower()
                     if low.endswith(".qkdownloading"):
                         continue
+                    if os.path.splitext(low)[1] in self._KEEP_INTACT_EXT:
+                        continue        # 电子书/文档：原样保留，不拆
                     fp = os.path.join(r, f)
                     if low.endswith(".001") or low.endswith(".z01"):
                         volumes.append(fp)
@@ -354,7 +401,7 @@ class Pipeline:
             # 优先分卷，其次明确后缀，最后才嗅探；嗅探放最后避免误伤媒体文件
             targets = volumes + named + sniffed[:20]
             if not targets:
-                return
+                return leftovers
             progressed = False
             for t in targets:
                 if not os.path.exists(t):
@@ -362,12 +409,23 @@ class Pipeline:
                 for pw, ok, _o in self._try_passwords(t, passwords):
                     if not ok:
                         break
-                    before = self._dir_stats(root)[0]
-                    self.sz.extract(t, os.path.dirname(t), pw)
-                    after = self._dir_stats(root)[0]
+                    # 一次扫描同时拿到"有哪些文件"和"多大"，避免每个密码
+                    # 都跑三遍全树 stat（大包几千个文件时这是纯浪费）
+                    before = self._scan_tree(root)
+                    ex_ok, _ex_out = self.sz.extract(t, os.path.dirname(t), pw)
+                    after = self._scan_tree(root)
+                    # 判断"有没有真解出东西"要看字节数：密码不对时 7-Zip 也会
+                    # 写出 0 字节的占位文件，只数文件个数会被骗过去，
+                    # 然后把真正的内层包删掉（血案）。
+                    new_bytes = sum(sz for fp, sz in after.items()
+                                    if fp not in before)
+                    grew = new_bytes > 4096
+                    if not (ex_ok or grew):
+                        self._drop_empty_new(root, before)
+                        continue            # 这个密码不行，换下一个
                     if t.lower().endswith((".001", ".z01")):
                         self._delete_volume_set(t)
-                    elif after > before:
+                    else:
                         # 确实解出了新内容，才删掉内层包
                         try:
                             os.chmod(t, 0o666)
@@ -379,8 +437,64 @@ class Pipeline:
                             pass
                     progressed = True
                     break
+                if os.path.exists(t):
+                    # 这一轮没解开（缺密码 / 加密头 / 拿不到目录）：
+                    # 只要它还躺在那儿，就说明这包没解完，必须往上报。
+                    # 否则外层会被当成成功，用户只拿到一个打不开的壳。
+                    if t not in leftovers:
+                        leftovers.append(t)
+                    log(f"   内层包没解开: {os.path.basename(t)}")
             if not progressed:
-                return
+                return leftovers
+        return leftovers
+
+    @staticmethod
+    def _scan_tree(root: str) -> dict[str, int]:
+        """一次遍历拿到 {文件路径: 大小}。
+
+        os.walk + getsize 每个文件要 stat 一次；这里用 scandir，
+        Windows 上目录项本身常带大小，能省掉一次系统调用。
+        """
+        out: dict[str, int] = {}
+        stack = [root]
+        while stack:
+            d = stack.pop()
+            try:
+                with os.scandir(d) as it:
+                    for e in it:
+                        try:
+                            if e.is_dir(follow_symlinks=False):
+                                stack.append(e.path)
+                            elif e.is_file(follow_symlinks=False):
+                                out[e.path] = e.stat(follow_symlinks=False).st_size
+                        except OSError:
+                            continue
+            except OSError:
+                continue
+        return out
+
+    @staticmethod
+    def _drop_empty_new(root: str, before) -> None:
+        """清掉本轮解压失败留下的 0 字节残渣（只碰新增的空文件）。"""
+        for r, _d, fs in os.walk(root):
+            for f in fs:
+                fp = os.path.join(r, f)
+                if fp in before:
+                    continue
+                try:
+                    if os.path.getsize(fp) == 0:
+                        os.remove(fp)
+                except OSError:
+                    pass
+        # 顺手收掉空目录，免得越积越多
+        for r, _ds, _fs in os.walk(root, topdown=False):
+            if r == root:
+                continue
+            try:
+                if not os.listdir(r):
+                    os.rmdir(r)
+            except OSError:
+                pass
 
     @staticmethod
     def _delete_volume_set(vol001: str):
@@ -408,12 +522,17 @@ class Pipeline:
         skip_dirs: set[str] | None = None,
         include_other: bool = True,
         works_out: list[dict] | None = None,
+        group: str | None = None,
     ) -> tuple[int, int, list[str]]:
         """把 src_root 下的文件分类搬到目标目录。
 
         图片 -> <dest>/图片/<顶层目录>/...
         视频 -> <dest>/视频/<顶层目录>/...
+        书籍 -> <dest>/书籍/<顶层目录>/...   （epub 这类电子书，保持原样不拆）
         其它 -> <dest>/其他/<顶层目录>/...   （include_other=True 时）
+
+        解压结果里顶层就是散文件的（没有作品目录），会用 group（源包名）
+        给它们建一个目录，免得一堆文件平铺在桶根下、彼此混在一起。
 
         重要：绝不能静默丢弃文件。搬不动的会记进 errors，调用方据此决定
         是否删除源文件。返回 (moved_files, moved_bytes, errors)。
@@ -422,22 +541,22 @@ class Pipeline:
         plan: list[tuple[str, str]] = []  # (src, dest)
         # 记录每个作品目录的去向与统计，供"一键查看刚解压的"用
         works: dict[tuple[str, str], list[int]] = {}
+        buckets = {"image": "图片", "video": "视频", "book": "书籍"}
+
+        def bucket_of(kind: str | None) -> str | None:
+            if kind in buckets:
+                return buckets[kind]
+            return "其他" if include_other else None
 
         def plan_tree(top_name: str, dir_path: str):
             for r, _d, fs in os.walk(dir_path):
                 for f in fs:
                     fp = os.path.join(r, f)
-                    kind = self._media_kind(fp)
+                    bucket = bucket_of(self._media_kind(fp))
+                    if bucket is None:
+                        continue
                     rel = os.path.relpath(fp, dir_path)
                     sub = self._strip_dup(rel, top_name)
-                    if kind == "image":
-                        bucket = "图片"
-                    elif kind == "video":
-                        bucket = "视频"
-                    elif include_other:
-                        bucket = "其他"
-                    else:
-                        continue
                     plan.append((fp, os.path.join(dest_root, bucket, top_name, sub)))
                     key = (bucket, top_name)
                     e = works.setdefault(key, [0, 0])
@@ -454,17 +573,19 @@ class Pipeline:
                     continue
                 plan_tree(name, p)
             else:
-                kind = self._media_kind(p)
-                if kind == "image":
-                    bucket = "图片"
-                elif kind == "video":
-                    bucket = "视频"
-                elif include_other:
-                    bucket = "其他"
-                else:
+                bucket = bucket_of(self._media_kind(p))
+                if bucket is None:
                     continue
-                plan.append((p, os.path.join(dest_root, bucket, name)))
-                key = (bucket, name)
+                # 散文件：有 group（源包名）就归到它下面，否则直接放桶里。
+                # 注意别写成 join(..., 空串, name)：join 会给空串补一个分隔符，
+                # 路径尾巴多一个反斜杠，open 直接报错。
+                top = group if group else name
+                if group:
+                    dst = os.path.join(dest_root, bucket, group, name)
+                else:
+                    dst = os.path.join(dest_root, bucket, name)
+                plan.append((p, dst))
+                key = (bucket, top)
                 e = works.setdefault(key, [0, 0])
                 e[0] += 1
                 try:
@@ -541,9 +662,10 @@ class Pipeline:
             for it in plan:
                 do_one(it)
 
-        # 搬迁后仍留在源目录里的文件 = 没被安全归档的，必须报给调用方
-        leftover = [os.path.join(r, f)
-                    for r, _d, fs in os.walk(src_root) for f in fs]
+        # 搬迁后仍留在源目录里的文件 = 没被安全归档的，必须报给调用方。
+        # 复制模式（move=False）源文件本来就该留着，不能算遗留。
+        leftover = [] if not move else [os.path.join(r, f)
+                                        for r, _d, fs in os.walk(src_root) for f in fs]
         if leftover:
             errors.append(f"未能归档的文件 {len(leftover)} 个（保留在暂存区）: "
                           + ", ".join(os.path.basename(x) for x in leftover[:5]))
@@ -564,8 +686,12 @@ class Pipeline:
             + (f", {len(errors)} 个问题" if errors else ""))
         return moved, moved_bytes, errors
 
+    # 拷贝分块：实测 D:->H: 跨盘 1GB，8MB 分块 144 MB/s，1MB 只有 110 MB/s，
+    # 16MB 反而回落到 89 MB/s（目标盘写缓存的关系）
+    COPY_CHUNK = 8 << 20
+
     @staticmethod
-    def _copy_file(src: str, dst: str, chunk: int = 4 << 20):
+    def _copy_file(src: str, dst: str, chunk: int = COPY_CHUNK):
         """裸读写复制。比 shutil.copy2 快数倍——后者会逐个文件同步元数据，
         在网络盘/外置盘上这部分开销可能比数据本身还大。"""
         with open(src, "rb") as fi, open(dst, "wb") as fo:

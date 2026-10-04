@@ -148,9 +148,13 @@ class App(tk.Tk):
         ttk.Checkbutton(opt, text="归档后删除解压输出（源压缩包另由下方开关决定）",
                         variable=self.inbox_move_var).grid(row=0, column=1, sticky="w", padx=6, pady=6)
         self.inbox_del_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(opt, text="归档成功后删除源压缩包（建议先确认结果再勾选）",
-                        variable=self.inbox_del_var).grid(row=1, column=0, columnspan=2,
-                                                          sticky="w", padx=6, pady=(0, 6))
+        ttk.Checkbutton(opt, text="归档成功后删除源压缩包（送回收站，建议先确认结果再勾选）",
+                        variable=self.inbox_del_var).grid(row=1, column=0, sticky="w",
+                                                          padx=6, pady=(0, 6))
+        self.pending_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opt, text="密码未知的包自动移到 _待补密码",
+                        variable=self.pending_var).grid(row=1, column=1, sticky="w",
+                                                        padx=6, pady=(0, 6))
         self.auto_open_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(opt, text="处理完自动打开刚解压的内容",
                         variable=self.auto_open_var).grid(row=2, column=0, columnspan=2,
@@ -162,12 +166,17 @@ class App(tk.Tk):
         self.inbox_btn.pack(side="left")
         ttk.Button(run, text="预览待处理", command=self._preview_inbox).pack(side="left", padx=6)
         ttk.Button(run, text="查看刚解压的", command=self._open_recent).pack(side="left", padx=(0, 6))
+        self.clean_btn = ttk.Button(run, text="删除已解压的源包",
+                                    command=self._clean_sources)
+        self.clean_btn.pack(side="left", padx=(0, 6))
         self.stop_btn = ttk.Button(run, text="停止", command=self._request_stop, state="disabled")
         self.stop_btn.pack(side="left")
 
         ttk.Label(root,
                   text="一键处理 = 扫描收件目录 → 解压（含套娃）→ 分类归档 → 刷新清单 → "
-                       "自动打开刚解压的内容。",
+                       "自动打开刚解压的内容。\n"
+                       "「删除已解压的源包」只删成功归档过、之后没重新下载的源包"
+                       "（按处理记录判断），默认送回收站。",
                   foreground="#666", wraplength=940, justify="left").pack(anchor="w", padx=PAD)
 
     # -- 解压 --------------------------------------------------------------
@@ -225,7 +234,7 @@ class App(tk.Tk):
         self.move_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(opt, text="移动（归档后删除源文件；取消则复制保留）",
                         variable=self.move_var).grid(row=0, column=0, sticky="w", padx=6, pady=6)
-        ttk.Label(opt, text="图片 → <归档到>\\图片\\   视频 → <归档到>\\视频\\   其他 → <归档到>\\其他\\",
+        ttk.Label(opt, text="图片 → <归档到>\\图片\\   视频 → <归档到>\\视频\\   书籍(epub 等) → <归档到>\\书籍\\   其他 → <归档到>\\其他\\",
                   foreground="#666").grid(row=1, column=0, sticky="w", padx=6, pady=(0, 6))
 
         run = ttk.Frame(root)
@@ -405,6 +414,43 @@ class App(tk.Tk):
             extra = f"（{n} 个文件/分卷）" if n > 1 else ""
             self.write(f"   - {label} {extra}")
 
+    def _clean_sources(self):
+        """一键删除已经解压归档好的源压缩包（默认送回收站）。"""
+        from . import cleanup
+        if self.busy:
+            return
+        try:
+            items, _stale = cleanup.scan_cleanable()
+        except Exception as exc:
+            messagebox.showerror("错误", f"读处理记录失败: {exc}")
+            return
+        if not items:
+            self.write("没有可删的源包（没有已解压归档的记录，或源包已经删过了）。")
+            return
+        total = sum(it["size"] for it in items)
+        preview = "\n".join(f"  {_human(it['size'])}  {it['path']}" for it in items[:12])
+        if len(items) > 12:
+            preview += f"\n  ... 另外 {len(items) - 12} 个"
+        if not messagebox.askyesno(
+                "删除已解压的源包",
+                f"将删除 {len(items)} 个已经解压归档好的源包，共 {_human(total)}：\n\n"
+                f"{preview}\n\n"
+                "只删处理记录里确认成功归档过、之后没重新下载的包。\n"
+                "默认送进回收站，删错还能捞回来。\n\n确定删除吗？"):
+            self.write("已取消删除。")
+            return
+
+        self.write(f"清理 {len(items)} 个源包，共 {_human(total)} ...")
+        try:
+            res = cleanup.clean_sources(to_trash=True, log=self.write)
+        except Exception as exc:
+            messagebox.showerror("错误", f"删除失败: {exc}")
+            return
+        self.write(f"已删除 {res['count']} 个，释放 {_human(res['bytes'])}"
+                   + ("（在回收站里）" if res["count"] else ""))
+        for p in res["errors"]:
+            self.write(f"   !! 删不掉: {p}")
+
     def _run_inbox(self):
         if self.busy:
             return
@@ -427,10 +473,11 @@ class App(tk.Tk):
                          args=(inbox, dest,
                                self.scan_var.get(),
                                self.inbox_move_var.get(),
-                               self.inbox_del_var.get()),
+                               self.inbox_del_var.get(),
+                               self.pending_var.get()),
                          daemon=True).start()
 
-    def _worker_inbox(self, inbox, dest, scan, move, del_source):
+    def _worker_inbox(self, inbox, dest, scan, move, del_source, move_pending):
         try:
             import importlib
             inbox_mod = importlib.import_module("收件箱")
@@ -460,7 +507,7 @@ class App(tk.Tk):
             # 传可调用对象 → 每次尝试密码都取最新值（热加载）
             pws = self.pw_store.get
 
-            ok_n = fail_n = 0
+            ok_n = fail_n = pending_n = 0
             all_works: list[dict] = []
             for i, (label, open_path, sources) in enumerate(items, 1):
                 if self.stop_flag.is_set():
@@ -480,6 +527,14 @@ class App(tk.Tk):
                 if not res.ok:
                     self.log_q.put(("log", f"  !! 失败: {res.error}"))
                     fail_n += 1
+                    if res.reason == "password" and move_pending:
+                        # 密码未知的包挪到一起，免得每次跑都白试一遍密码
+                        where = inbox_mod.move_to_pending(inbox, label, sources)
+                        if where:
+                            pending_n += 1
+                            self.log_q.put(("log", f"  -> 已移入 {where}"))
+                        self.log_q.put(("log",
+                                        f"     （补上密码后跑：收件箱.py \"{os.path.dirname(where)}\" \"{dest}\"）"))
                     continue
 
                 # 安全闸门 1：解压结果必须像样
@@ -504,6 +559,7 @@ class App(tk.Tk):
                     works: list[dict] = []
                     moved, mbytes, errors = pipe.archive_by_type(
                         outdir, dest, move=True,
+                        group=inbox_mod._pending_name(label, sources),
                         log=lambda m: self.log_q.put(("log", "  " + m)),
                         works_out=works)
                 except Exception as exc:
@@ -519,15 +575,11 @@ class App(tk.Tk):
                     continue
 
                 if del_source:
-                    for s in dict.fromkeys(sources):
-                        try:
-                            os.chmod(s, 0o666)
-                        except OSError:
-                            pass
-                        try:
-                            os.remove(s)
-                        except OSError:
-                            pass
+                    # 送回收站而不是直接抹掉，删错了还能捞回来
+                    from . import trash
+                    _ok, bad = trash.delete(dict.fromkeys(sources), to_trash=True)
+                    for s in bad:
+                        self.log_q.put(("log", f"  !! 源包删不掉: {s}"))
                 inbox_mod.mark_done(done, sources)
                 all_works.extend(works)
                 self.log_q.put(("log", f"  -> {res.files} 个文件 / {_human(res.bytes_)}"
@@ -537,6 +589,12 @@ class App(tk.Tk):
             shutil.rmtree(staging, ignore_errors=True)
             inbox_mod._save_done(done)
             self.log_q.put(("log", f"完成：成功 {ok_n}，失败 {fail_n}"))
+            if pending_n:
+                inbox_mod.write_pending_list(inbox)
+                self.log_q.put(("log",
+                                f"密码未知的 {pending_n} 个包已移入 "
+                                f"{os.path.join(inbox, inbox_mod.PENDING_DIR)}"
+                                "（补上密码后单独跑那个目录即可）"))
 
             # 记录本次结果，供"查看刚解压的"
             if all_works:

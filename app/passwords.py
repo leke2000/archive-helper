@@ -22,8 +22,17 @@ DEFAULT_PASSWORD_FILE = r"D:\dowm\解压密码.txt"
 _PW_INLINE = re.compile(r"密码\s*[:：]\s*([^\s,，、;；|]+)")
 
 
+def _clean_line(s: str) -> str:
+    """密码文件里的一行：去掉空白和引号，原文使用。"""
+    return (s or "").strip().strip("\"'")
+
+
 def _plausible_password(s: str) -> bool:
-    """过滤掉误匹配：URL、路径、说明性长句都不是密码。"""
+    """过滤掉误匹配：URL、路径、说明性长句都不是密码。
+
+    只用于"自动扫描"到的候选（说明文本、目录名）——
+    手工写进密码文件的条目一律原文采信，见 _read_file()。
+    """
     s = (s or "").strip().strip("\"'")
     if not s or len(s) > 64:
         return False
@@ -36,6 +45,17 @@ def _plausible_password(s: str) -> bool:
     if "密码" in s:
         return False
     return True
+
+
+def _is_password_line(s: str) -> bool:
+    """密码文件里的这一行算不算一个密码。
+
+    故意比 _plausible_password 宽松：密码本身就是"长得像别的东西"才安全，
+    www.moehui.com、有斜杠的句子、超过 64 字符的都有可能真是密码。
+    只排除空行和 # 注释。
+    """
+    s = _clean_line(s)
+    return bool(s) and not s.startswith("#") and len(s) <= 200
 
 
 def _read_text(path: str) -> str | None:
@@ -66,12 +86,20 @@ class PasswordStore:
 
     # -- 读取 -------------------------------------------------------------
     def _read_file(self) -> list[str]:
+        """密码文件里的条目一律原文采信。
+
+        密码是用户自己写的，长什么样都可能（www.moehui.com 这种域名很常见）。
+        以前这里套了"像不像密码"的过滤，结果把域名密码吃掉、还顺手从文件里
+        删掉，等于把用户的密码弄丢了。
+        """
         out: list[str] = []
         text = _read_text(self.path) if os.path.isfile(self.path) else None
         if text:
             for line in text.splitlines():
-                s = line.strip().strip("\"'")
-                if _plausible_password(s) and s not in out:
+                if not _is_password_line(line):
+                    continue
+                s = _clean_line(line)
+                if s not in out:
                     out.append(s)
         return out
 
@@ -127,12 +155,8 @@ class PasswordStore:
             self._manual = from_file
             self._mtime = mtime
             self.last_load = time.time()
-            # 文件里若有不符合规则的残留（例如早先误写入的 URL），顺手清理
-            stale = [ln.strip().strip("\"'")
-                     for ln in (_read_text(self.path) or "").splitlines()
-                     if ln.strip() and not _plausible_password(ln.strip().strip("\"'"))]
-        if stale:
-            self._write_file(from_file)
+        # 注意：这里绝不能"顺手清理"密码文件里看着不像密码的行 ——
+        # 那会把用户的密码（比如 www.moehui.com）直接从文件里删掉。
         return changed
 
     # -- 写回 -------------------------------------------------------------
@@ -152,8 +176,9 @@ class PasswordStore:
             pass
 
     def add(self, pw: str) -> bool:
-        pw = (pw or "").strip()
-        if not pw or not _plausible_password(pw):
+        """手动添加密码：原文采信（用户敲进去的就是密码）。"""
+        pw = _clean_line(pw)
+        if not _is_password_line(pw):
             return False
         with self._lock:
             if pw in self._pws:

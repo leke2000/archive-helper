@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import struct
+import zlib
 from dataclasses import dataclass, field
 
 # archive container signatures
@@ -26,6 +27,8 @@ SIG_RAR5 = b"Rar!\x1a\x07\x01\x00"
 SIG_RAR4 = b"Rar!\x1a\x07\x00"
 SIG_ZIP_LOCAL = b"PK\x03\x04"
 SIG_ZIP_EOCD = b"PK\x05\x06"
+# 拷贝分块：实测 8MB 在跨盘（D:->H:）比 1MB 快 30%，比 32MB 也快
+COPY_CHUNK = 8 << 20
 SIG_GZIP = b"\x1f\x8b\x08"
 
 ARCHIVE_SIGS = (SIG_7Z, SIG_RAR5, SIG_RAR4, SIG_ZIP_LOCAL)
@@ -206,6 +209,39 @@ def _tail_reversed_ok(path: str, size: int) -> Detection | None:
     return Detection("tail_reversed", L, 0, sig, notes)
 
 
+def _archive_header_ok(path: str, off: int, sig: bytes) -> bool:
+    """判断某个偏移处的"归档签名"是不是真的归档头。
+
+    随机数据里撞出 4 字节签名的概率并不低（9GB 的文件里有 1~2 次），
+    我们真的踩到过：一个加密伪装包里 7.3GB 处有个假 PK，
+    结果白拷贝了 1.79GB 才发现不是 zip。所以这里按各格式的头字段再验一遍。
+    """
+    try:
+        with open(path, "rb") as f:
+            f.seek(off)
+            head = f.read(64)
+    except OSError:
+        return False
+    if not head.startswith(sig):
+        return False
+    if sig == SIG_ZIP_LOCAL:
+        if len(head) < 30:
+            return False
+        ver, flags, method = struct.unpack("<HHH", head[4:10])
+        namelen, extralen = struct.unpack("<HH", head[26:30])
+        return (10 <= ver <= 63) and (method <= 100)             and (0 < namelen <= 4096) and (extralen <= 65536)
+    if sig == SIG_7Z:
+        if len(head) < 32:
+            return False
+        crc = struct.unpack("<I", head[8:12])[0]
+        return zlib.crc32(head[12:32]) == crc     # 7z 起始头自带 CRC32
+    if sig == SIG_RAR5:
+        return len(head) >= 8 and 8 <= struct.unpack("<H", head[5:7])[0] <= (1 << 20)
+    if sig == SIG_RAR4:
+        return len(head) >= 9 and 7 <= struct.unpack("<H", head[7:9])[0] <= (1 << 20)
+    return True
+
+
 def detect(path: str) -> Detection:
     """Classify how (if at all) the file is disguised."""
     size = os.path.getsize(path)
@@ -226,6 +262,9 @@ def detect(path: str) -> Detection:
     best: tuple[int, bytes] | None = None
     for sig in ARCHIVE_SIGS:
         off = _find_signature(path, sig, start=start)
+        # 一直往后找，直到找到"头字段也说得通"的那个（防随机撞签名）
+        while off is not None and off > 0 and not _archive_header_ok(path, off, sig):
+            off = _find_signature(path, sig, start=off + 1)
         if off is not None and off > 0:
             if best is None or off < best[0]:
                 best = (off, sig)
@@ -350,7 +389,7 @@ def _restore_tail_reversed(path, out, L, progress=None):
         with open(path, "rb") as f:
             f.seek(L)
             remaining = middle_len
-            chunk = 32 << 20
+            chunk = COPY_CHUNK
             while remaining > 0:
                 b = f.read(min(chunk, remaining))
                 if not b:
@@ -377,7 +416,7 @@ def _copy(path, out, start, length=None, progress=None):
     with open(path, "rb") as fi, open(out, "wb") as fo:
         fi.seek(start)
         remaining = length
-        chunk = 32 << 20
+        chunk = COPY_CHUNK
         while remaining > 0:
             b = fi.read(min(chunk, remaining))
             if not b:

@@ -24,21 +24,46 @@ def app_root() -> str:
 
 
 def find_7za() -> str | None:
-    """Return the path to a usable 7za/7z executable, or None."""
+    """找一个可用的解压引擎。
+
+    优先完整版 `7z.exe`（带 7z.dll，支持 RAR5 / ISO 等），
+    其次精简版 `7za.exe`（不支持 RAR5）。两者命令行用法一致。
+
+    名字保留 find_7za 是为了兼容既有调用方。
+    """
     root = app_root()
-    candidates = [
-        os.path.join(root, "bin", "7za.exe"),
+    preferred = [
         os.path.join(root, "bin", "7z.exe"),
+        os.path.join(root, "bin", "7z"),
+        os.path.join(root, "bin", "7za.exe"),
         os.path.join(root, "bin", "7za"),
     ]
-    for path in candidates:
+    for path in preferred:
         if os.path.isfile(path):
             return path
-    for name in ("7za", "7za.exe", "7z", "7z.exe"):
+    for name in ("7z", "7z.exe", "7za", "7za.exe"):
         found = shutil.which(name)
         if found:
             return found
     return None
+
+
+def engine_supports_rar5(exe: str | None) -> bool:
+    """这个引擎认不认 RAR5。
+
+    精简版 7za.exe 打开 RAR5 只会报 "Cannot open the file as archive"，
+    跟"密码错/文件坏"分不开，所以这里先按引擎判断，好在失败时给一句人话。
+    完整版 7z.exe 的解压器都在同目录的 7z.dll 里，缺了它什么也开不了。
+    """
+    if not exe:
+        return False
+    name = os.path.basename(exe).lower()
+    if name.startswith("7za"):
+        return False
+    if name.startswith("7z"):
+        return os.path.isfile(os.path.join(os.path.dirname(exe), "7z.dll"))
+    # 其它工具（unrar.exe / bz.exe 等）也可能支持，不妄下结论
+    return True
 
 
 class SevenZip:

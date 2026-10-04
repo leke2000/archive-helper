@@ -1,10 +1,14 @@
 # Windows 上用 py / python 启动即可（这行原来是 shebang，会害 py.exe 找错解释器）
-"""一键处理：扫描收件箱 -> 解压 -> 分类归档 -> 刷新清单 -> 打开刚解压的。
+r"""一键处理：扫描收件箱 -> 解压 -> 分类归档 -> 刷新清单 -> 打开刚解压的。
 
 用法：
     一键.py                 # 用默认目录，处理完自动打开看图
     一键.py --no-open       # 不自动打开
-    一键.py --delete-source # 处理成功后删除源压缩包
+    一键.py --delete-source # 处理成功后删除源压缩包（送回收站）
+    一键.py --clean-source  # 结束后再清一遍已解压归档的源包
+    一键.py --redo          # 无视处理记录，全部重来
+
+密码未知的包会自动移进 <收件箱>\_待补密码\，不会每次跑都白试一遍。
 
 配合桌面快捷方式，双击即可完成整条流程。
 """
@@ -45,6 +49,7 @@ def human(n: float) -> str:
 def main() -> int:
     open_when_done = "--no-open" not in sys.argv
     delete_source = "--delete-source" in sys.argv
+    clean_source = "--clean-source" in sys.argv
 
     inbox = INBOX
     dest = DEST
@@ -97,7 +102,7 @@ def main() -> int:
     os.makedirs(staging, exist_ok=True)
 
     pipe = Pipeline(SevenZip(), salvage=True)
-    ok_n = fail_n = 0
+    ok_n = fail_n = pending_n = 0
     all_works: list[dict] = []
     failed: list[str] = []
 
@@ -115,6 +120,12 @@ def main() -> int:
             print(f"    !! 失败: {res.error}")
             fail_n += 1
             failed.append(label)
+            if res.reason == "password":
+                # 密码未知的包挪到一起，免得每次跑都白试一遍密码
+                where = inbox_mod.move_to_pending(inbox, label, sources)
+                if where:
+                    pending_n += 1
+                    print(f"    -> 已移入 {where}")
             continue
 
         # 闸门 1：解压结果必须像样
@@ -136,9 +147,10 @@ def main() -> int:
             continue
 
         works: list[dict] = []
-        _m, _b, errors = pipe.archive_by_type(outdir, dest, move=True,
-                                             log=lambda m: print("    " + m),
-                                             works_out=works)
+        _m, _b, errors = pipe.archive_by_type(
+            outdir, dest, move=True,
+            group=inbox_mod._pending_name(label, sources),
+            log=lambda m: print("    " + m), works_out=works)
         if errors:
             print(f"    !! {len(errors)} 个文件未能归档，源文件保留：")
             for e in errors[:5]:
@@ -151,15 +163,11 @@ def main() -> int:
         inbox_mod.mark_done(done, sources)
 
         if delete_source:
-            for s in dict.fromkeys(sources):
-                try:
-                    os.chmod(s, 0o666)
-                except OSError:
-                    pass
-                try:
-                    os.remove(s)
-                except OSError:
-                    pass
+            # 送回收站而不是直接抹掉，删错了还能捞回来
+            from app import trash
+            _ok, bad = trash.delete(dict.fromkeys(sources), to_trash=True)
+            for s in bad:
+                print(f"    !! 源包删不掉: {s}")
 
         detail = "，".join(f"{w['kind']} {w['files']}" for w in works[:4])
         print(f"    -> {res.files} 个文件 / {human(res.bytes_)}  "
@@ -178,6 +186,19 @@ def main() -> int:
     if failed:
         print("未成功：" + "、".join(failed))
     inbox_mod._save_done(done)
+    if pending_n:
+        inbox_mod.write_pending_list(inbox)
+        print(f"密码未知的 {pending_n} 个包已移入 "
+              f"{os.path.join(inbox, inbox_mod.PENDING_DIR)}"
+              "（补上密码后单独跑那个目录即可）")
+
+    # 结束后再清一遍已经解压归档好的源包
+    if clean_source:
+        from app import cleanup
+        print("清理已解压的源包...")
+        res = cleanup.clean_sources(log=lambda m: print("  " + m))
+        print(f"已删除 {res['count']} 个源包，释放 {human(res['bytes'])}"
+              + ("（在回收站里）" if res["count"] else ""))
 
     # 刷新检索清单
     if ok_n:

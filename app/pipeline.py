@@ -7,6 +7,7 @@ callback and never calls sys.exit.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -361,6 +362,11 @@ class Pipeline:
 
     # 这些"本质是压缩包"的文档不能当套娃解：epub/cbz 是电子书、
     # apk/docx 是安装包和文档，拆开就毁了（epub 拆完只剩一堆 html）
+    # 名字里带卷号、后面还跟杂字的分卷：xxx.7z.001.jpg / xxx.zip.002删
+    # 这种第二卷之后没有文件头签名，只能靠名字认出来
+    _PART_RE = re.compile(r"^(?P<base>.+\.(?:7z|zip|rar))\.(?P<vol>\d{3})(?P<tail>.*)$",
+                          re.IGNORECASE)
+
     _KEEP_INTACT_EXT = {
         ".epub", ".mobi", ".azw", ".azw3", ".fb2", ".cbz", ".cbr", ".djvu",
         ".docx", ".xlsx", ".pptx", ".docm", ".xlsm", ".pptm", ".odt", ".ods",
@@ -388,6 +394,16 @@ class Pipeline:
             return "tar"
         return None
 
+    @staticmethod
+    def _link_or_copy(src: str, dst: str) -> None:
+        """优先硬链接（同盘瞬时、不占空间），失败就复制。"""
+        if os.path.exists(dst):
+            return
+        try:
+            os.link(src, dst)
+        except OSError:
+            shutil.copy2(src, dst)
+
     def _extract_nested(self, root: str, passwords, log: LogFn) -> list[str]:
         """解开解压结果里嵌套的压缩包。
 
@@ -408,7 +424,11 @@ class Pipeline:
             volumes = []
             named = []
             sniffed = []
+            parts: dict[str, dict[int, str]] = {}      # 卷名前缀 -> {卷号: 文件}
             for r, _d, fs in os.walk(root):
+                # 跳过自己建的卷名链接目录（避免把链接当成新内容再归档一遍）
+                if any(x.startswith("_vols_") for x in r.split(os.sep)):
+                    continue
                 for f in fs:
                     low = f.lower()
                     if low.endswith(".qkdownloading"):
@@ -416,15 +436,52 @@ class Pipeline:
                     if os.path.splitext(low)[1] in self._KEEP_INTACT_EXT:
                         continue        # 电子书/文档：原样保留，不拆
                     fp = os.path.join(r, f)
-                    if low.endswith(".001") or low.endswith(".z01"):
+                    # 名字带卷号、后面还跟杂字的分卷（如 "xxx.7z.001.jpg"）：
+                    # 第二卷之后没有文件头签名，只能靠名字认，先归组
+                    m = self._PART_RE.match(f)
+                    if m:
+                        parts.setdefault(m.group("base"), {})[int(m.group("vol"))] = fp
+                        continue
+                    if low.endswith(".z01"):
                         volumes.append(fp)
                     elif low.endswith((".7z", ".zip", ".rar")):
                         named.append(fp)
                     elif self._sniff_archive(fp):
                         sniffed.append(fp)
 
+            # 把"名字被改过的分卷"按规范卷名建一套入口（7-Zip 只认 base.001/.002…）
+            vol_files: dict[str, list[str]] = {}       # 入口 -> 成功后要删的文件
+            out_dirs: dict[str, str] = {}              # 入口 -> 解压输出到哪
+            links_dir = None
+            for base, volmap in sorted(parts.items()):
+                vols = sorted(volmap)
+                entry_vol = 1 if 1 in vols else vols[0]
+                if len(vols) == 1 and (
+                        os.path.basename(volmap[vols[0]])
+                        == os.path.basename(base) + f".{vols[0]:03d}"):
+                    volumes.append(volmap[vols[0]])     # 本来就是规范名，直接用
+                    continue
+                if links_dir is None:
+                    links_dir = tempfile.mkdtemp(
+                        prefix="_vols_", dir=os.path.dirname(volmap[vols[0]]))
+                links = []
+                for v in vols:
+                    dst = os.path.join(links_dir, os.path.basename(base) + f".{v:03d}")
+                    self._link_or_copy(volmap[v], dst)
+                    links.append(dst)
+                entry = os.path.join(links_dir,
+                                     os.path.basename(base) + f".{entry_vol:03d}")
+                if entry not in vol_files:
+                    volumes.insert(0, entry)
+                    vol_files[entry] = links + [volmap[v] for v in vols]
+                    # 关键是输出目录：要落到分卷原本所在的地方，绝不能是
+                    # 我们建链接用的临时目录（否则解出来的东西会被一起清掉）
+                    out_dirs[entry] = os.path.dirname(volmap[vols[0]])
+
             # 优先分卷，其次明确后缀，最后才嗅探；嗅探放最后避免误伤媒体文件
             targets = volumes + named + sniffed[:20]
+            if links_dir:
+                log(f"   发现 {len(parts)} 套名字被改过的分卷，已建好入口")
             if not targets:
                 return leftovers
             progressed = False
@@ -437,7 +494,8 @@ class Pipeline:
                     # 一次扫描同时拿到"有哪些文件"和"多大"，避免每个密码
                     # 都跑三遍全树 stat（大包几千个文件时这是纯浪费）
                     before = self._scan_tree(root)
-                    ex_ok, ex_out = self.sz.extract(t, os.path.dirname(t), pw)
+                    ex_ok, ex_out = self.sz.extract(
+                        t, out_dirs.get(t) or os.path.dirname(t), pw)
                     after = self._scan_tree(root)
                     # 判断"有没有真解出东西"要看字节数：密码不对时 7-Zip 也会
                     # 写出 0 字节的占位文件，只数文件个数会被骗过去，
@@ -456,7 +514,10 @@ class Pipeline:
                         if t not in leftovers:
                             leftovers.append(t)
                         continue
-                    if t.lower().endswith((".001", ".z01")):
+                    if t in vol_files:
+                        for fp in vol_files[t]:
+                            self._force_remove(fp)
+                    elif t.lower().endswith((".001", ".z01")):
                         self._delete_volume_set(t)
                     else:
                         # 确实解出了新内容，才删掉内层包
@@ -477,6 +538,8 @@ class Pipeline:
                     if t not in leftovers:
                         leftovers.append(t)
                     log(f"   内层包没解开: {os.path.basename(t)}")
+            if links_dir:
+                shutil.rmtree(links_dir, ignore_errors=True)
             if not progressed:
                 return leftovers
         return leftovers

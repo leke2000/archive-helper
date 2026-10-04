@@ -273,7 +273,11 @@ class Pipeline:
                     res.error = _no_rar_engine_hint(archive)
                     res.reason = "no_engine"
                 else:
-                    res.error = "无法通过完整性校验（密码错误或文件损坏）"
+                    # 分卷齐、密码也不像错（头部能读、报的是 CRC/数据错），
+                    # 那就是数据本身坏了 —— 多半是没按站点要求下原画质
+                    res.error = ("文件数据损坏：分卷和密码都没问题，但数据对不上 CRC。"
+                                 "一般是下载时被转码/传坏，按站点说明重新下载"
+                                 "（通常要求「下载原画质」）")
                     res.reason = "corrupt"
                 log("错误: " + res.error)
                 return res

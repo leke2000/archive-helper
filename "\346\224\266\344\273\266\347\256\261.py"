@@ -87,6 +87,31 @@ _KNOWN_EXT = _MEDIA_EXT | {
 }
 
 
+def _zip_has_eocd(path: str) -> bool:
+    """zip 的目录（EOCD）永远在文件末尾且不加密；末尾 64KB 里找不到，
+    基本就是分卷的一部分或者没下完。"""
+    try:
+        sz = os.path.getsize(path)
+        with open(path, "rb") as f:
+            f.seek(max(0, sz - 65536))
+            return b"PK" in f.read()
+    except OSError:
+        return False
+
+
+def _still_downloading(path: str) -> str:
+    """同目录有没有同名（或同前缀）的 .qkdownloading 陪跑 —— 有就说明还在下。"""
+    d = os.path.dirname(os.path.abspath(path))
+    stem = os.path.splitext(os.path.basename(path))[0]
+    try:
+        for n in os.listdir(d):
+            if n.endswith(".qkdownloading") and (stem[:12] in n or n.startswith(stem[:12])):
+                return n
+    except OSError:
+        pass
+    return ""
+
+
 def log(msg: str) -> None:
     print(msg, flush=True)
 
@@ -219,7 +244,31 @@ def collect(inbox: str):
             if name.endswith(".qkdownloading"):
                 continue
             p = os.path.join(root, name)
+
+            # --- 没下完 / 分卷不齐的预检：先说清楚，别白跑一遍 CRC ---
+            busy = _still_downloading(p)
+            if busy:
+                log(f"  (跳过还在下载的 {name}，同目录有 {busy})")
+                continue
+            low = name.lower()
+
+            # 分卷 zip 的第 1..N 卷：必须有收尾卷 x.zip 才能解开
+            if re.search(r"\.z\d\d$", low):
+                last = os.path.join(root, re.sub(r"\.z\d\d$", ".zip", name))
+                if not os.path.exists(last):
+                    log(f"  !! {name} 是分卷 zip 的一卷，缺收尾卷 "
+                        f"{os.path.basename(last)}，凑齐后会自动处理")
+                    continue
+
             base, vol = parse_part(name)
+            # 只有 .001、没有 .002，末尾又没有 zip 目录 -> 缺卷或没下完。
+            # 7z 不这样判：它的头里写着整个流的长度，由解压流程报"还差多少"更准。
+            if (vol is not None and low.endswith(".zip.001")
+                    and not os.path.exists(os.path.join(root, name[:-4] + ".002"))
+                    and not _zip_has_eocd(p)):
+                log(f"  !! {name} 末尾没有 zip 目录，像是分卷的一部分或没下完，"
+                    "先跳过（凑齐后会自动处理）")
+                continue
             if base is None:
                 ext = os.path.splitext(name)[1].lower()
                 # 名字不像压缩包：可能是尾部反转 / 追加型伪装

@@ -57,18 +57,25 @@ class SevenZip:
             capture_output=True,
             text=True,
             errors="replace",
+            stdin=subprocess.DEVNULL,   # 别让 7za 停下来问密码
             creationflags=_CREATE_NO_WINDOW,
             timeout=timeout,
         )
         return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
 
+    @staticmethod
+    def _pw_arg(password: str | None) -> str:
+        """密码参数。始终显式给 -p（空密码就是 -p），否则 7za 会交互式索要密码。
+
+        头部加密的包不带 -p 时，7za 会打印 "Enter password" 然后卡住/等输入，
+        既拿不到 "Wrong password" 这句关键报错，也有挂起的风险。
+        """
+        return "-p" + (password or "")
+
     # -- operations --------------------------------------------------------
     def list(self, path: str, password: str | None = None) -> tuple[bool, str, str]:
         """Return (ok, archive_type, raw_output)."""
-        args = ["l", "-slt"]
-        if password:
-            args.append("-p" + password)
-        args.append(path)
+        args = ["l", "-slt", self._pw_arg(password), path]
         rc, out = self.run(args)
         atype = ""
         m = re.search(r"^Type = (.+)$", out, re.MULTILINE)
@@ -79,10 +86,7 @@ class SevenZip:
 
     def test(self, path: str, password: str | None = None) -> tuple[bool, str]:
         """Integrity test. Returns (ok, output)."""
-        args = ["t"]
-        if password:
-            args.append("-p" + password)
-        args.append(path)
+        args = ["t", self._pw_arg(password), path]
         rc, out = self.run(args)
         if "Wrong password" in out or "Invalid password" in out:
             return False, out
@@ -100,8 +104,7 @@ class SevenZip:
         if overwrite:
             args.append("-aoa")
         args.append("-o" + outdir)
-        if password:
-            args.append("-p" + password)
+        args.append(self._pw_arg(password))
         args.append(path)
         rc, out = self.run(args)
         ok = "Everything is Ok" in out

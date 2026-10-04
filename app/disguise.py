@@ -132,6 +132,37 @@ def is_incomplete_7z(path: str) -> bool:
     return total > os.path.getsize(path)
 
 
+def missing_volume_bytes(path: str) -> int:
+    """首卷还缺多少字节才算完整；不缺（或不是首卷）返回 0。
+
+    只拿首卷自己跟头里的总大小比会误判：分卷集的首卷本来就"比整个归档小"。
+    必须把同目录下的 .002/.003... 一起累加，才能分清是真缺卷，还是
+    分卷都在、只是密码不对（头部加密时 7-Zip 报的是 Wrong password）。
+    """
+    if not path.lower().endswith(".001"):
+        return 0
+    try:
+        with open(path, "rb") as f:
+            head = f.read(32)
+        if len(head) < 32 or not head.startswith(SIG_7Z):
+            return 0
+        nho, nhs = struct.unpack("<QQ", head[12:28])
+        if nho == 0 or nhs == 0:
+            return 0
+        need = 32 + nho + nhs
+        have = 0
+        base = path[:-4]
+        for i in range(1, 1000):
+            vol = f"{base}.{i:03d}"
+            if os.path.exists(vol):
+                have += os.path.getsize(vol)
+            elif i > 1:
+                break       # 分卷编号必须连续，断了就是缺卷
+        return max(0, need - have)
+    except (OSError, struct.error):
+        return 0
+
+
 def _looks_like_media(head: bytes) -> bool:
     for sig in MEDIA_SIGS:
         idx = head.find(sig)

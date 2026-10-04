@@ -49,13 +49,19 @@ def _looks_incomplete(output: str) -> bool:
     return any(m in low for m in _INCOMPLETE_MARKERS)
 
 
-def _next_volume_hint(archive: str) -> str:
+def _next_volume_hint(archive: str, missing_bytes: int = 0) -> str:
     """缺分卷时给一句人话提示，指出下一个该来的分卷叫什么。"""
+    tail = f"（还差 {missing_bytes/1048576:.0f} MB）" if missing_bytes else ""
     low = archive.lower()
     if low.endswith(".001"):
-        return (f"缺少后续分卷（如 {os.path.basename(archive)[:-4]}.002）；"
+        return (f"缺少后续分卷{tail}（如 {os.path.basename(archive)[:-4]}.002）；"
                 "同一套的所有分卷要放在一起才能解压")
-    return "压缩包不完整：缺少后续分卷，或下载没完成"
+    return f"压缩包不完整{tail}：缺少后续分卷，或下载没完成"
+
+
+def _locked_headers_hint(archive: str) -> str:
+    return ("密码不对：这个包连文件头都是加密的，拿不到目录就没法解"
+            "（分卷本身是齐的）")
 
 
 def _looks_encrypted(list_output: str) -> bool:
@@ -212,7 +218,13 @@ class Pipeline:
             pw_used = None
             tested = False
             salvaged = False
-            incomplete = disguise.is_incomplete_7z(archive)
+            # 该不该说"缺分卷"，要看同目录下的分卷加起来够不够，而不是只看首卷
+            missing = disguise.missing_volume_bytes(archive)
+            incomplete = missing > 0
+            # 头部加密（连目录都看不到）时要能识别出来，否则会被误报成"文件损坏"
+            probe_ok, _atype, probe_out = self.sz.list(archive, None)
+            locked = (not probe_ok) and _looks_like_wrong_password(probe_out)
+            wrong_pw = False
             for pw, ok, _out in self._try_passwords(archive, passwords):
                 good, tout = self.sz.test(archive, pw)
                 # 密码错和数据坏都会让 test 失败，但处理方式完全不同：
@@ -221,6 +233,7 @@ class Pipeline:
                 if not good and _looks_incomplete(tout):
                     incomplete = True
                 if not good and _looks_like_wrong_password(tout):
+                    wrong_pw = True
                     log(f"密码 {pw or '无'} 不正确，继续尝试其他密码")
                     continue
                 pw_used = pw
@@ -236,9 +249,12 @@ class Pipeline:
                 salvaged = True
 
             if not tested and not (salvaged and self.salvage):
-                # 缺分卷常被误报成"密码错误"，这里单独说清楚
+                # 缺分卷常被误报成"密码错误"，反过来头部加密也常被当成"文件损坏"，
+                # 这里按真正的原因给话
                 if incomplete:
-                    res.error = _next_volume_hint(archive)
+                    res.error = _next_volume_hint(archive, missing)
+                elif wrong_pw or locked:
+                    res.error = _locked_headers_hint(archive)
                 else:
                     res.error = "无法通过完整性校验（密码错误或文件损坏）"
                 log("错误: " + res.error)

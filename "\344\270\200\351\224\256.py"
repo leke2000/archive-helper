@@ -165,9 +165,12 @@ def main() -> int:
         if delete_source:
             # 送回收站而不是直接抹掉，删错了还能捞回来
             from app import trash
+            from app import cleanup as _cleanup
             _ok, bad = trash.delete(dict.fromkeys(sources), to_trash=True)
             for s in bad:
                 print(f"    !! 源包删不掉: {s}")
+            for d in _cleanup.prune_empty_dirs(_ok, [inbox]):
+                print(f"    (空目录已删: {d})")
 
         detail = "，".join(f"{w['kind']} {w['files']}" for w in works[:4])
         print(f"    -> {res.files} 个文件 / {human(res.bytes_)}  "

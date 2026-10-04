@@ -576,10 +576,12 @@ class App(tk.Tk):
 
                 if del_source:
                     # 送回收站而不是直接抹掉，删错了还能捞回来
-                    from . import trash
+                    from . import trash, cleanup as _cleanup
                     _ok, bad = trash.delete(dict.fromkeys(sources), to_trash=True)
                     for s in bad:
                         self.log_q.put(("log", f"  !! 源包删不掉: {s}"))
+                    for d in _cleanup.prune_empty_dirs(_ok, [inbox]):
+                        self.log_q.put(("log", f"  (空目录已删: {d})"))
                 inbox_mod.mark_done(done, sources)
                 all_works.extend(works)
                 self.log_q.put(("log", f"  -> {res.files} 个文件 / {_human(res.bytes_)}"

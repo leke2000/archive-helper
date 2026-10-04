@@ -65,6 +65,8 @@ def main() -> int:
     res = cleanup.clean_sources(to_trash=to_trash, log=lambda m: print(m))
     print()
     print(f"已删除 {res['count']} 个包，释放 {human(res['bytes'])}")
+    if res.get("pruned"):
+        print(f"顺手删掉 {len(res['pruned'])} 个空文件夹")
     if res["errors"]:
         print("删不掉这些（可能被占用）：")
         for p in res["errors"]:

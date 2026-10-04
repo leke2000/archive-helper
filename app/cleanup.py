@@ -80,6 +80,55 @@ def mark_done(done: dict, sources) -> None:
             pass
 
 
+def prune_empty_dirs(paths, keep_roots: list[str] | None = None) -> list[str]:
+    """源包删掉后，把它们空掉的父目录也一起收掉。
+
+    只删"空目录"（os.rmdir 非空会失败，天然安全），并且只在 keep_roots
+    范围之内动手 —— 收件箱本身和盘根永远不会被删。
+    keep_roots 没给就取这些文件所在目录的最深公共父目录。
+    """
+    paths = [os.path.abspath(p) for p in paths]
+    if not paths:
+        return []
+    if not keep_roots:
+        dirs = {os.path.dirname(p) for p in paths}
+        if len(dirs) == 1:
+            # 都在同一个包里：允许连这个包目录一起收掉（但绝不动盘根，
+            # 也不动直接装着文件的收件箱本身）
+            only = next(iter(dirs))
+            parent = os.path.dirname(only)
+            keep_roots = [parent if os.path.dirname(parent) != parent else only]
+        else:
+            try:
+                keep_roots = [os.path.commonpath(list(dirs))]
+            except ValueError:          # 跨盘，各算各的
+                keep_roots = sorted(dirs)
+    def norm(x: str) -> str:
+        # Windows 路径大小写不敏感，短名/长名也可能不一致，统一归一化再比
+        return os.path.normcase(os.path.normpath(os.path.abspath(x)))
+
+    keep = [norm(r) for r in keep_roots if r]
+    removed: list[str] = []
+    for p in paths:
+        d = os.path.dirname(os.path.abspath(p))
+        while True:
+            da = os.path.abspath(d)
+            dna = norm(da)
+            if os.path.dirname(da) == da:        # 到盘根，停
+                break
+            if any(dna == k for k in keep):      # 到保留目录，停
+                break
+            if not any(dna.startswith(k + os.sep) for k in keep):
+                break                            # 不在允许范围内，别动
+            try:
+                os.rmdir(da)                      # 只在空目录时成功
+            except OSError:
+                break
+            removed.append(da)
+            d = os.path.dirname(da)
+    return removed
+
+
 def scan_cleanable(done: dict | None = None) -> tuple[list[dict], list[str]]:
     """找出记录里"可以删"的源文件。
 
@@ -108,6 +157,7 @@ def clean_sources(
     to_trash: bool = True,
     dry_run: bool = False,
     log=None,
+    keep_roots: list[str] | None = None,
 ) -> dict:
     """删除已经成功归档的源包，并从记录里移除。
 
@@ -132,9 +182,13 @@ def clean_sources(
     ok, bad = trash.delete(paths, to_trash=to_trash)
     for p in ok:
         done.pop(p, None)
+    pruned = prune_empty_dirs(ok, keep_roots)
+    for d in pruned:
+        say(f"   顺手收掉空目录: {d}")
     if not dry_run and done is not None:
         save_done(done, log=say)
 
     return {"count": len(ok), "bytes": sum(
         it["size"] for it in items if it["path"] in set(ok)),
-        "errors": bad, "paths": ok, "stale": stale, "dry_run": False}
+        "errors": bad, "paths": ok, "stale": stale, "dry_run": False,
+        "pruned": pruned}

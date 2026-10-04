@@ -622,6 +622,9 @@ def main() -> int:
             ok_del, bad_del = trash.delete(dict.fromkeys(sources), to_trash=True)
             for s in bad_del:
                 log(f"   !! 源包删不掉: {s}")
+            # 源包删完，外面空掉的文件夹也一起收掉（收件箱本身不动）
+            for d in cleanup.prune_empty_dirs(ok_del, [inbox]):
+                log(f"   (空目录已删: {d})")
 
         detail = "，".join(f"{w['kind']} {w['files']}" for w in works[:4])
         log(f"   -> {res.files} 个文件 / {human(res.bytes_)}  "

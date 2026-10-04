@@ -215,13 +215,28 @@ class Pipeline:
 
             archive = source
             tmp_archive = None
-            if det.kind in ("tail_reversed", "appended"):
-                tmp_archive = os.path.join(workdir, "_restored.bin")
-                log("还原伪装文件...")
-                disguise.restore(source, tmp_archive, det, progress=progress)
-                archive = tmp_archive
-                res.add(f"已还原为 {os.path.getsize(tmp_archive):,} 字节")
+            # Apate 这类"面具伪装"可以套好几层（它自己的还原一次只剥一层），
+            # 所以这里循环剥：每剥一层重新检测，直到不再是伪装为止。
+            for layer in range(1, 7):
+                if det.kind not in ("tail_reversed", "appended"):
+                    break
+                if layer > 1 and det.kind == "tail_reversed" \
+                        and not (0 < det.decoy_len <= disguise.MAX_MASK_LEN):
+                    break          # 超过面具长度上限，说明已经剥到底了
+                nxt = os.path.join(workdir, f"_restored{layer}.bin")
+                if layer == 1:
+                    log("还原伪装文件...")
+                else:
+                    log(f"  还有一层伪装，继续剥（第 {layer} 层）...")
+                disguise.restore(archive, nxt, det, progress=progress)
+                if tmp_archive and os.path.exists(tmp_archive):
+                    os.remove(tmp_archive)
+                tmp_archive = nxt
+                archive = nxt
+                res.add(f"已还原为 {os.path.getsize(tmp_archive):,} 字节"
+                        + (f"（第 {layer} 层）" if layer > 1 else ""))
                 log(res.steps[-1])
+                det = disguise.detect(archive)
 
             # test integrity first (avoids producing half-extracted junk)
             pw_used = None
@@ -307,9 +322,14 @@ class Pipeline:
                     names = "、".join(os.path.basename(p) for p in leftovers[:3])
                     if len(leftovers) > 3:
                         names += f" 等 {len(leftovers)} 个"
-                    res.error = (f"内层还有包没解开（多半缺密码）：{names}；"
-                                 "密码补齐后重跑即可")
-                    res.reason = "password"
+                    if any(_looks_like_wrong_password(o) for o in lockout):
+                        res.error = (f"内层还有包没解开（缺密码）：{names}；"
+                                     "密码补齐后重跑即可")
+                        res.reason = "password"
+                    else:
+                        res.error = (f"内层包没能完整解开（{names}）："
+                                     "多半是下载损坏或分卷不齐，源文件已保留")
+                        res.reason = "corrupt"
                     log("错误: " + res.error)
                     return res
 
@@ -383,6 +403,7 @@ class Pipeline:
         比直接报错还坑。
         """
         leftovers: list[str] = []
+        lockout: list[str] = []          # 内层失败时的 7-Zip 输出（判断是缺密码还是损坏）
         for _ in range(3):
             volumes = []
             named = []
@@ -416,7 +437,7 @@ class Pipeline:
                     # 一次扫描同时拿到"有哪些文件"和"多大"，避免每个密码
                     # 都跑三遍全树 stat（大包几千个文件时这是纯浪费）
                     before = self._scan_tree(root)
-                    ex_ok, _ex_out = self.sz.extract(t, os.path.dirname(t), pw)
+                    ex_ok, ex_out = self.sz.extract(t, os.path.dirname(t), pw)
                     after = self._scan_tree(root)
                     # 判断"有没有真解出东西"要看字节数：密码不对时 7-Zip 也会
                     # 写出 0 字节的占位文件，只数文件个数会被骗过去，
@@ -427,6 +448,14 @@ class Pipeline:
                     if not (ex_ok or grew):
                         self._drop_empty_new(root, before)
                         continue            # 这个密码不行，换下一个
+                    if not ex_ok:
+                        # 有文件出来但 7-Zip 报了错（常见于部分条目损坏/分卷不齐）：
+                        # 不能当成功 —— 否则会拿不完整的内容去归档。
+                        lockout.append(ex_out)
+                        log(f"   内层包解压报错（只解出一部分）: {os.path.basename(t)}")
+                        if t not in leftovers:
+                            leftovers.append(t)
+                        continue
                     if t.lower().endswith((".001", ".z01")):
                         self._delete_volume_set(t)
                     else:

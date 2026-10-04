@@ -179,6 +179,28 @@ def _is_blank(buf: bytes) -> bool:
     return len(buf) > 0 and buf == b"\x00" * len(buf)
 
 
+# Apate 的面具是媒体/可执行文件（mp4/jpg/mov/EXE），不是归档 —— 反转尾部
+# 之后如果出现这些"文件头"，同样说明这是尾部反转伪装
+_FILE_HEADS = (
+    b"ftyp", b"moov", b"mdat", b"\xff\xd8\xff", b"\x89PNG", b"GIF8", b"RIFF",
+    b"\x1aE\xdf\xa3", b"MZ", b"%PDF", b"OggS", b"FLV", b"wOFF", b"OTTO",
+    b"\x7fELF", b"BM", b"II*\x00", b"MM\x00*", b"\x00\x00\x01\x00",
+)
+# Apate 源码里的上限：面具最长 2GB/7 ≈ 306MB；超过这个值就不可能是面具长度
+MAX_MASK_LEN = 2147483647 // 7
+
+
+def _looks_like_file_head(b: bytes) -> bool:
+    """这段字节像不像一个文件的开头（用于判断"反转尾部得到的是原文件头"）。"""
+    for sig in _FILE_HEADS:
+        if b.startswith(sig):
+            return True
+    # ftyp 在偏移 4 处（如 00 00 00 20 66 74 79 70 ...）
+    if len(b) >= 8 and b[4:8] in (b"ftyp", b"moov", b"mdat"):
+        return True
+    return False
+
+
 def _tail_reversed_ok(path: str, size: int) -> Detection | None:
     """Try to interpret the file as [decoy][body][reverse(decoy)][L].
 
@@ -196,6 +218,14 @@ def _tail_reversed_ok(path: str, size: int) -> Detection | None:
     reversed_head = tail_block[::-1]
     sig = _sig_name(reversed_head)
     if not sig:
+        # 归档签名没有，但"反转后的尾部"如果是媒体/可执行文件头，
+        # 那同样是 Apate 这类"面具伪装"（面具是 mp4/jpg/EXE，不是压缩包）
+        if _looks_like_file_head(reversed_head):
+            notes = [f"decoy {L} bytes, 反转尾部是文件头（面具伪装）"]
+            head = _read_head(path, 64)
+            if _looks_like_media(head):
+                notes.append("decoy looks like media")
+            return Detection("tail_reversed", L, 0, "", notes)
         return None
 
     head = _read_head(path, 64)

@@ -315,8 +315,9 @@ class Pipeline:
                 log(f"解压报告异常，但已恢复 {files_now} 个文件")
 
             # recurse into any nested volumes (salvage path needs this too)
+            lockout: list[str] = []
             if recurse:
-                leftovers = self._extract_nested(outdir, passwords, log)
+                leftovers, lockout = self._extract_nested(outdir, passwords, log)
                 if leftovers:
                     # 内层还有没解开的包：整包按"缺密码"处理，等补齐再来，
                     # 不然归档出去的是个打不开的空壳
@@ -404,7 +405,7 @@ class Pipeline:
         except OSError:
             shutil.copy2(src, dst)
 
-    def _extract_nested(self, root: str, passwords, log: LogFn) -> list[str]:
+    def _extract_nested(self, root: str, passwords, log: LogFn) -> tuple[list[str], list[str]]:
         """解开解压结果里嵌套的压缩包。
 
         三层保险避免漏解：
@@ -483,7 +484,7 @@ class Pipeline:
             if links_dir:
                 log(f"   发现 {len(parts)} 套名字被改过的分卷，已建好入口")
             if not targets:
-                return leftovers
+                return leftovers, lockout
             progressed = False
             for t in targets:
                 if not os.path.exists(t):
@@ -541,8 +542,8 @@ class Pipeline:
             if links_dir:
                 shutil.rmtree(links_dir, ignore_errors=True)
             if not progressed:
-                return leftovers
-        return leftovers
+                return leftovers, lockout
+        return leftovers, lockout
 
     @staticmethod
     def _scan_tree(root: str) -> dict[str, int]:
@@ -593,19 +594,38 @@ class Pipeline:
                 pass
 
     @staticmethod
-    def _delete_volume_set(vol001: str):
-        base = vol001[:-4]
-        i = 1
-        while i <= 999:
+    def _delete_volume_set(entry: str):
+        """删掉一整套分卷（两种命名都要认）：
+
+          * x.7z.001 / x.7z.002 …      （7-Zip 风格）
+          * x.z01 / x.z02 … / x.zip    （WinRAR 风格的分卷 zip，收尾卷叫 .zip）
+
+        这一处以前只认第一种：.z01 那套解完之后分卷没被删掉，于是被当成
+        "内层包没解开"，整包白判失败 —— 内容其实早就解出来了。
+        """
+        base = re.sub(r"\.(?:z\d\d|\d{3}|zip)$", "", entry, flags=re.IGNORECASE)
+        victims: list[str] = []
+        for i in range(1, 1000):                     # x.001 / x.002 …
             v = f"{base}.{i:03d}"
-            if os.path.exists(v):
-                try:
-                    os.remove(v)
-                except OSError:
-                    pass
-                i += 1
-            else:
+            if not os.path.exists(v):
                 break
+            victims.append(v)
+        for i in range(1, 1000):                     # x.z01 / x.z02 …
+            v = f"{base}.z{i:02d}"
+            if not os.path.exists(v):
+                break
+            victims.append(v)
+        tail = f"{base}.zip"                         # WinRAR 分卷的收尾卷
+        if os.path.exists(tail):
+            victims.append(tail)
+        if not victims and os.path.exists(entry):
+            victims.append(entry)
+        for v in victims:
+            try:
+                os.chmod(v, 0o666)
+                os.remove(v)
+            except OSError:
+                pass
 
     # -- archiving ---------------------------------------------------------
     def archive_by_type(

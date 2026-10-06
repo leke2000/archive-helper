@@ -237,6 +237,7 @@ def collect(inbox: str):
     parts: dict[str, dict] = {}      # base -> {vol_or_None: [paths]}
     disguised: list[str] = []        # 伪装成媒体文件的包
     sniffed: list[tuple[str, str]] = []   # (源路径, 补齐后的名字)
+    zitems: list[tuple[str, str, list[str]]] = []   # 分卷 zip（x.z01…x.zip）
 
     for root, dirs, files in os.walk(inbox):
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
@@ -252,13 +253,28 @@ def collect(inbox: str):
                 continue
             low = name.lower()
 
-            # 分卷 zip 的第 1..N 卷：必须有收尾卷 x.zip 才能解开
+            # 工具自己产生的中间文件不要当成包（_restored1.bin 这种）
+            if low.startswith("_restored") or low.endswith((".qkdownloading",)):
+                continue
+            if root.split(os.sep)[-1].startswith(("_work", "_vols_", "_parts",
+                                                  "_staging", "_inbox", "_kept")):
+                continue
+
+            # 分卷 zip（x.z01 / x.z02 … / x.zip）：能解，入口用收尾卷 x.zip，
+            # 这样 7-Zip 会自己把 z01/z02 一起带上；缺收尾卷就等下载
             if re.search(r"\.z\d\d$", low):
                 last = os.path.join(root, re.sub(r"\.z\d\d$", ".zip", name))
                 if not os.path.exists(last):
                     log(f"  !! {name} 是分卷 zip 的一卷，缺收尾卷 "
                         f"{os.path.basename(last)}，凑齐后会自动处理")
                     continue
+                parts = [os.path.join(root, f) for f in sorted(os.listdir(root))
+                         if f == os.path.basename(last)
+                         or re.fullmatch(re.escape(os.path.basename(last)[:-4])
+                                         + r"\.z\d\d", f, re.IGNORECASE)]
+                zitems.append((f"{os.path.basename(last)[:-4]}（分卷 zip {len(parts)} 卷）",
+                               last, parts))
+                continue
 
             base, vol = parse_part(name)
             # 只有 .001、没有 .002，末尾又没有 zip 目录 -> 缺卷或没下完。
@@ -348,6 +364,9 @@ def collect(inbox: str):
             log(f"  !! {base} 建立分卷入口失败: {exc}")
             continue
         items.append((f"{base}（{len(chosen)} 卷）", entries[0], all_paths))
+
+    # 分卷 zip
+    items.extend(zitems)
 
     # 伪装成媒体文件的包
     for fp in disguised:

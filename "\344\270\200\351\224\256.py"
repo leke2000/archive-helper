@@ -161,6 +161,9 @@ def main() -> int:
 
         all_works.extend(works)
         inbox_mod.mark_done(done, sources)
+        # 归档成功后，把源包所在目录里空掉的文件夹顺手收掉
+        for d in inbox_mod.cleanup.prune_empty_dirs(list(dict.fromkeys(sources)), [inbox]):
+            print(f"    (空文件夹已删: {d})")
 
         if delete_source:
             # 送回收站而不是直接抹掉，删错了还能捞回来

@@ -583,6 +583,10 @@ class App(tk.Tk):
                     for d in _cleanup.prune_empty_dirs(_ok, [inbox]):
                         self.log_q.put(("log", f"  (空目录已删: {d})"))
                 inbox_mod.mark_done(done, sources)
+                # 归档成功后，把源包所在目录里空掉的文件夹顺手收掉
+                for d in inbox_mod.cleanup.prune_empty_dirs(
+                        list(dict.fromkeys(sources)), [inbox]):
+                    self.log_q.put(("log", f"  (空文件夹已删: {d})"))
                 all_works.extend(works)
                 self.log_q.put(("log", f"  -> {res.files} 个文件 / {_human(res.bytes_)}"
                                        + ("  (源包已删除)" if del_source else "  (源包保留)")))
